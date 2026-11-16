@@ -60,6 +60,11 @@ function pairCurlExample(
   -d '${payload}'`
 }
 
+/** One-line setup for Claude Code (`claude mcp add`, streamable HTTP transport). */
+function claudeCodeCommand(port: number, token: string): string {
+  return `claude mcp add --transport http sshbool http://127.0.0.1:${port}/mcp --header "Authorization: Bearer ${token}"`
+}
+
 export function PairingDialog({
   open,
   onOpenChange,
@@ -76,6 +81,7 @@ export function PairingDialog({
   const [method, setMethod] = useState<PairingMethod>("token")
   const [copiedToken, setCopiedToken] = useState(false)
   const [copiedConfig, setCopiedConfig] = useState(false)
+  const [copiedClaude, setCopiedClaude] = useState(false)
   const [copiedCode, setCopiedCode] = useState(false)
   const [copiedCurl, setCopiedCurl] = useState(false)
   const [countdown, setCountdown] = useState("")
@@ -85,6 +91,7 @@ export function PairingDialog({
       setMethod("token")
       setCopiedToken(false)
       setCopiedConfig(false)
+      setCopiedClaude(false)
       setCopiedCode(false)
       setCopiedCurl(false)
     }
@@ -113,6 +120,15 @@ export function PairingDialog({
     void navigator.clipboard.writeText(pairing.cursorConfig)
     setCopiedConfig(true)
     window.setTimeout(() => setCopiedConfig(false), 2000)
+  }
+
+  const copyClaude = () => {
+    if (!pairing) return
+    void navigator.clipboard.writeText(
+      claudeCodeCommand(port, pairing.accessToken)
+    )
+    setCopiedClaude(true)
+    window.setTimeout(() => setCopiedClaude(false), 2000)
   }
 
   const copyCode = () => {
@@ -272,6 +288,32 @@ export function PairingDialog({
                 Paste into Cursor → Settings → MCP (or{" "}
                 <code className="text-xs">~/.cursor/mcp.json</code>), then
                 restart Cursor.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs">Claude Code</Label>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={copyClaude}
+                >
+                  {copiedClaude ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                  {copiedClaude ? "Copied" : "Copy command"}
+                </Button>
+              </div>
+              <pre className="w-full max-w-md rounded-xl border border-border/70 bg-muted/20 p-2 font-mono text-[10px] break-all whitespace-pre-wrap select-all">
+                {claudeCodeCommand(port, pairing.accessToken)}
+              </pre>
+              <p className="text-[11px] text-muted-foreground">
+                Run in a terminal. Other agents (VS Code, Windsurf, …) use the
+                same URL with the token as an Authorization: Bearer header.
               </p>
             </div>
           </div>

@@ -8,7 +8,12 @@ function isBusy(status: string) {
   return status === "active" || status === "queued"
 }
 
-/** Warn before quitting while uploads/downloads are still running. */
+/**
+ * Warn before closing a secondary window while uploads/downloads are still running.
+ * The main window's close/quit is handled in Rust (src-tauri/src/tray.rs): closing it hides
+ * SSHBool to the tray, and quitting warns about transfers there. A JS close listener on the
+ * main window would destroy it instead of hiding it.
+ */
 export function useTransferCloseGuard(enabled = true) {
   useEffect(() => {
     if (!enabled) return
@@ -18,6 +23,7 @@ export function useTransferCloseGuard(enabled = true) {
 
     void (async () => {
       const win = getCurrentWindow()
+      if (win.label === "main" || cancelled) return
       unlisten = await win.onCloseRequested(async (event) => {
         let active = 0
         try {

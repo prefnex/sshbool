@@ -10,8 +10,36 @@ use serde_json::{json, Value};
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
 
-/// 32-byte key for encrypted Guacamole connection tokens.
-pub const GUAC_TOKEN_KEY: &[u8; 32] = b"SSHBoolGuacamoleDesktopTokenKey1";
+type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+
+/// Per-process random keys for Guacamole connection tokens.
+///
+/// Tokens are minted and consumed by this same process (the local WebSocket bridge), so the
+/// keys never need to leave memory. A compile-time constant would be public in an open-source
+/// repository and let any local process forge or decrypt tokens (they carry RDP passwords).
+struct TokenKeys {
+    enc: [u8; 32],
+    mac: [u8; 32],
+}
+
+fn token_keys() -> &'static TokenKeys {
+    static KEYS: std::sync::OnceLock<TokenKeys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let mut enc = [0u8; 32];
+        let mut mac = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut enc);
+        rand::rngs::OsRng.fill_bytes(&mut mac);
+        TokenKeys { enc, mac }
+    })
+}
+
+fn token_mac(iv: &[u8], ciphertext: &[u8]) -> HmacSha256 {
+    use hmac::Mac;
+    let mut mac = HmacSha256::new_from_slice(&token_keys().mac).expect("hmac accepts any key size");
+    mac.update(iv);
+    mac.update(ciphertext);
+    mac
+}
 
 /// Build a guacamole connection token payload for RDP over an SSH tunnel.
 pub fn build_rdp_token(
@@ -38,6 +66,8 @@ pub fn build_rdp_token(
         "username": username,
         "password": password,
         "security": "any",
+        // guacd cannot pin certificates; rdp_cert::verify_or_pin pins it over the same tunnel
+        // immediately before this token is minted (VULN-08).
         "ignore-cert": "true",
         "width": width,
         "height": height,
@@ -70,9 +100,9 @@ pub fn encrypt_token(payload: &Value) -> Result<String, String> {
     let plaintext = serde_json::to_string(payload).map_err(|e| e.to_string())?;
 
     let mut iv = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut iv);
+    rand::rngs::OsRng.fill_bytes(&mut iv);
 
-    let cipher = Aes256CbcEnc::new_from_slices(GUAC_TOKEN_KEY, &iv)
+    let cipher = Aes256CbcEnc::new_from_slices(&token_keys().enc, &iv)
         .map_err(|e| format!("cipher init: {e}"))?;
     let block_size = 16;
     let pad = block_size - (plaintext.len() % block_size);
@@ -83,9 +113,15 @@ pub fn encrypt_token(payload: &Value) -> Result<String, String> {
         .map_err(|e| format!("encrypt: {e}"))?;
     let ciphertext = encrypted.to_vec();
 
+    let tag = {
+        use hmac::Mac;
+        token_mac(&iv, &ciphertext).finalize().into_bytes()
+    };
+
     let wrapper = json!({
         "iv": B64.encode(iv),
         "value": B64.encode(&ciphertext),
+        "mac": B64.encode(tag),
     });
 
     Ok(B64.encode(serde_json::to_string(&wrapper).map_err(|e| e.to_string())?))
@@ -107,7 +143,19 @@ pub fn decrypt_token(encoded: &str) -> Result<Value, String> {
         .decode(value_b64)
         .map_err(|e| format!("decode value: {e}"))?;
 
-    let cipher = Aes256CbcDec::new_from_slices(GUAC_TOKEN_KEY, &iv)
+    // Encrypt-then-MAC: reject tampered tokens before touching the CBC padding.
+    let tag_b64 = wrapper["mac"].as_str().ok_or("missing mac")?;
+    let tag = B64
+        .decode(tag_b64)
+        .map_err(|e| format!("decode mac: {e}"))?;
+    {
+        use hmac::Mac;
+        token_mac(&iv, &ciphertext)
+            .verify_slice(&tag)
+            .map_err(|_| "token authentication failed".to_string())?;
+    }
+
+    let cipher = Aes256CbcDec::new_from_slices(&token_keys().enc, &iv)
         .map_err(|e| format!("cipher init: {e}"))?;
     let mut buf = ciphertext;
     let decrypted = cipher
@@ -137,6 +185,28 @@ mod tests {
         let enc = encrypt_token(&payload).expect("encrypt");
         let dec = decrypt_token(&enc).expect("decrypt");
         assert_eq!(dec, payload);
+    }
+
+    #[test]
+    fn tampered_token_is_rejected() {
+        let enc = encrypt_token(&json!({ "a": 1 })).expect("encrypt");
+        let raw = B64.decode(&enc).unwrap();
+        let mut wrapper: Value = serde_json::from_slice(&raw).unwrap();
+        let mut ct = B64.decode(wrapper["value"].as_str().unwrap()).unwrap();
+        ct[0] ^= 1;
+        wrapper["value"] = json!(B64.encode(&ct));
+        let forged = B64.encode(serde_json::to_string(&wrapper).unwrap());
+        assert!(decrypt_token(&forged).is_err());
+    }
+
+    #[test]
+    fn token_without_mac_is_rejected() {
+        let enc = encrypt_token(&json!({ "a": 1 })).expect("encrypt");
+        let raw = B64.decode(&enc).unwrap();
+        let mut wrapper: Value = serde_json::from_slice(&raw).unwrap();
+        wrapper.as_object_mut().unwrap().remove("mac");
+        let forged = B64.encode(serde_json::to_string(&wrapper).unwrap());
+        assert!(decrypt_token(&forged).is_err());
     }
 
     #[test]

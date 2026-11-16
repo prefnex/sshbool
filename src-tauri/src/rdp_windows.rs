@@ -476,6 +476,9 @@ fn build_freerdp_base_args(opts: &RdpLaunchOpts<'_>, addr: &str) -> Vec<String> 
     let mut args = vec![
         format!("/v:{addr}"),
         format!("/u:{}", opts.username),
+        // The certificate was already pinned by rdp_cert::verify_or_pin over this tunnel.
+        // FreeRDP's own store is keyed by the random local port, so tofu there would pop a
+        // "certificate changed" dialog on port reuse and break auto-login.
         "/cert:ignore".to_string(),
         "/relax-order-checks".to_string(),
         "/log-level:WARN".to_string(),

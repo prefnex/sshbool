@@ -14,14 +14,109 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub const AGENT_INSTRUCTIONS: &str = r#"You are operating through SSHBool MCP Server — an infrastructure desktop workspace tool.
+pub const AGENT_INSTRUCTIONS: &str = r#"You are operating through SSHBool MCP Server — the user's SSH workspace (servers, files, services, containers, Kubernetes).
 
-SECURITY & OPERATIONAL CONTRACT:
-1. Never request or transmit private SSH keys, master passwords, vault keys, or raw credential blobs.
-2. Every tool call is gated by policy, audited, and logged to an immutable SQLite ledger.
-3. Operations in read_only mode return diagnostic data only. Write or dangerous operations will be blocked or require explicit human approval.
-4. Out-of-scope hosts do not exist in your workspace scope.
+HOW TO WORK:
+1. Call list_hosts first. Every host tool takes a host_id from that list; hosts not listed are not available to you.
+2. Prefer read-only tools (get_sysinfo, list_services, read_journal, read_file_preview, grep_files, list_containers, get_container_logs, ...). They run immediately.
+3. Write tools (write_file, edit_file_delta, rm_path, ...) and dangerous tools (exec_command, exec_script, restart_service, ...) pause until the user approves them in SSHBool. Always pass a short, honest "reason"; it is shown in the approval dialog. A denial or timeout is final for that call: do not retry the same call in a loop — explain to the user what you need instead.
+4. Command results contain stdout, stderr, exit_code and timed_out. A non-zero exit_code means the command failed.
+5. Before editing a file, read it; use edit_file_delta with an exact, unique target_content. Pass expected_mtime (from stat_path/read_file_preview) to avoid overwriting concurrent changes.
+6. Hosts marked production=true deserve extra care: explain the impact before proposing changes.
+
+SECURITY CONTRACT:
+- Never request or transmit private keys, passwords, vault contents or credential files; such paths are denied.
+- Every call is checked against the client's mode and host grants, and is recorded in the user's audit log.
 "#;
+
+/// Protocol revisions this server speaks (newest first). Responses are plain JSON over HTTP,
+/// which is valid for every revision listed.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Pick the client's requested revision when supported, else our newest.
+pub fn negotiate_protocol_version(params: &Value) -> &'static str {
+    let requested = params.get("protocolVersion").and_then(|v| v.as_str());
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .find(|v| Some(**v) == requested)
+        .copied()
+        .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0])
+}
+
+/// Render a tool's JSON result as MCP `CallToolResult` content.
+pub fn tool_result(value: Value) -> Value {
+    let text = render_tool_text(&value);
+    let mut out = json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+    });
+    if value.is_object() {
+        out["structuredContent"] = value;
+    }
+    out
+}
+
+/// A tool failure the agent should read and react to (MCP `isError: true`).
+pub fn tool_error(message: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": message }],
+        "isError": true,
+    })
+}
+
+/// Command output reads best as plain text; everything else as pretty JSON.
+fn render_tool_text(value: &Value) -> String {
+    if let Some(stdout) = value.get("stdout").and_then(|v| v.as_str()) {
+        let mut text = stdout.trim_end().to_string();
+        if let Some(stderr) = value.get("stderr").and_then(|v| v.as_str()) {
+            if !stderr.trim().is_empty() {
+                text.push_str("\n--- stderr ---\n");
+                text.push_str(stderr.trim_end());
+            }
+        }
+        let mut meta = Vec::new();
+        if let Some(code) = value.get("exit_code").and_then(|v| v.as_i64()) {
+            meta.push(format!("exit_code={code}"));
+        }
+        if let Some(sig) = value.get("exit_signal").and_then(|v| v.as_str()) {
+            meta.push(format!("signal={sig}"));
+        }
+        if value.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
+            meta.push("timed_out=true".into());
+        }
+        if value.get("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            meta.push("output_truncated=true".into());
+        }
+        for key in ["task_id", "log_path", "running"] {
+            if let Some(v) = value.get(key) {
+                if !v.is_null() {
+                    meta.push(format!(
+                        "{key}={}",
+                        v.as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| v.to_string())
+                    ));
+                }
+            }
+        }
+        if !meta.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[{}]", meta.join(" ")));
+        }
+        return text;
+    }
+    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+        // read_file_preview: the file itself, then its metadata.
+        let mut meta = value.clone();
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("content");
+        }
+        return format!("{content}\n[{}]", meta);
+    }
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
 
 pub async fn handle_protocol_request(
     pool: &SqlitePool,
@@ -33,20 +128,6 @@ pub async fn handle_protocol_request(
     req: JsonRpcRequest,
 ) -> JsonRpcResponse {
     let runtime = McpRuntimeState::global();
-    if runtime.is_vault_locked() {
-        return JsonRpcResponse::error(
-            req.id.clone(),
-            -32603,
-            "Vault is locked — MCP server degraded".to_string(),
-        );
-    }
-    if runtime.is_kill_switch_active() {
-        return JsonRpcResponse::error(
-            req.id.clone(),
-            -32603,
-            "MCP kill switch active".to_string(),
-        );
-    }
 
     let call_id = Uuid::now_v7().to_string();
     let started = std::time::Instant::now();
@@ -80,36 +161,55 @@ pub async fn handle_protocol_request(
 
     let result = match req.method.as_str() {
         "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": negotiate_protocol_version(&req.params),
             "capabilities": {
-                "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false },
-                "prompts": { "listChanged": false }
+                "tools": { "listChanged": false }
             },
             "serverInfo": {
-                "name": "SSHBool MCP Server",
+                "name": "sshbool",
+                "title": "SSHBool MCP Server",
                 "version": env!("CARGO_PKG_VERSION")
             },
             "instructions": AGENT_INSTRUCTIONS
         })),
+        "ping" => return JsonRpcResponse::success(id, json!({})),
         "tools/list" => {
-            let tools = get_tools_for_mode(mode);
-            let tool_objs: Vec<Value> = tools
+            let tool_objs: Vec<Value> = get_tools_for_mode(mode)
                 .into_iter()
                 .map(|t| {
+                    let read_only = t.tier == "safe";
                     json!({
                         "name": t.name,
                         "description": t.description,
-                        "inputSchema": t.input_schema
+                        "inputSchema": t.input_schema,
+                        "annotations": {
+                            "readOnlyHint": read_only,
+                            "destructiveHint": t.tier == "dangerous",
+                            "openWorldHint": true
+                        }
                     })
                 })
                 .collect();
-            Ok(json!({ "tools": tool_objs }))
+            return JsonRpcResponse::success(id, json!({ "tools": tool_objs }));
         }
+        // Not offered (no capability advertised), but answer politely for clients that ask anyway.
+        "resources/list" => return JsonRpcResponse::success(id, json!({ "resources": [] })),
+        "resources/templates/list" => {
+            return JsonRpcResponse::success(id, json!({ "resourceTemplates": [] }))
+        }
+        "prompts/list" => return JsonRpcResponse::success(id, json!({ "prompts": [] })),
         "tools/call" => {
             let name = tool_name.clone().unwrap_or_default();
             let args = &req.params["arguments"];
-            if let Err(e) = crate::policy::enforce::enforce_call_budget(pool, client_id).await {
+            if name.is_empty() {
+                Err(McpError::InvalidArguments("Missing tool name".into()))
+            } else if runtime.is_vault_locked() {
+                Err(McpError::VaultLocked)
+            } else if runtime.is_kill_switch_active() {
+                Err(McpError::McpStopped)
+            } else if let Err(e) =
+                crate::policy::enforce::enforce_call_budget(pool, client_id).await
+            {
                 Err(e)
             } else {
                 let ctx = ToolCallContext {
@@ -128,49 +228,9 @@ pub async fn handle_protocol_request(
                 dispatch_tool_call(&ctx, &name, args).await
             }
         }
-        "resources/list" => Ok(json!({
-            "resources": [
-                {
-                    "uri": "sshbool://facts",
-                    "name": "Host System Facts",
-                    "description": "Hardware and OS facts mirror",
-                    "mimeType": "application/json"
-                }
-            ]
-        })),
-        "resources/read" => Ok(json!({
-            "contents": [
-                {
-                    "uri": "sshbool://facts",
-                    "mimeType": "application/json",
-                    "text": "{\"status\":\"active\"}"
-                }
-            ]
-        })),
-        "prompts/list" => Ok(json!({
-            "prompts": [
-                {
-                    "name": "triage-service",
-                    "description": "Triage an unhealthy service"
-                }
-            ]
-        })),
-        "prompts/get" => Ok(json!({
-            "description": "Triage service instructions",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": {
-                        "type": "text",
-                        "text": "Please check systemctl status and read journalctl logs."
-                    }
-                }
-            ]
-        })),
-        _ => Err(McpError::ToolNotAvailable(format!(
-            "Method '{}' not found",
-            req.method
-        ))),
+        _ => {
+            return JsonRpcResponse::error(id, -32601, format!("Method '{}' not found", req.method))
+        }
     };
 
     let duration_ms = started.elapsed().as_millis() as i64;
@@ -263,18 +323,38 @@ pub async fn handle_protocol_request(
         error_code: err_code,
     });
 
-    match result {
-        Ok(val) => JsonRpcResponse::success(id, val),
-        Err(e) => JsonRpcResponse::error(id, -32603, e.to_string()),
+    match (req.method.as_str(), result) {
+        ("tools/call", Ok(val)) => JsonRpcResponse::success(id, tool_result(val)),
+        // Tool failures go back as results so the agent can read the reason and adapt.
+        ("tools/call", Err(e)) => JsonRpcResponse::success(id, tool_error(&agent_message(&e))),
+        (_, Ok(val)) => JsonRpcResponse::success(id, val),
+        (_, Err(e)) => JsonRpcResponse::error(id, -32603, e.to_string()),
     }
+}
+
+/// Error text for the agent, with a hint on what to do next where one helps.
+fn agent_message(e: &McpError) -> String {
+    let hint = match e {
+        McpError::VaultLocked => " — ask the user to unlock SSHBool, then retry.",
+        McpError::McpStopped => " — the user activated the MCP kill switch; stop and ask them.",
+        McpError::ApprovalDenied(_) => {
+            " — the user did not approve this call. Do not retry it automatically; explain what you need."
+        }
+        McpError::HostNotInScope(_) => " — call list_hosts to see the hosts you can use.",
+        McpError::CapabilityNotGranted(_) => {
+            " — the user can allow this per host in SSHBool → MCP → Clients."
+        }
+        McpError::ToolNotAvailable(_) => " — call tools/list to see the tools available in this client's mode.",
+        McpError::SessionExpired(_) => " — call open_session again.",
+        McpError::StaleMtime(_) => " — the file changed since you read it; read it again before editing.",
+        McpError::RateLimited { .. } => " — wait before retrying.",
+        _ => "",
+    };
+    format!("{e}{hint}")
 }
 
 fn preview_args(args: &Value) -> String {
     let raw = args.to_string();
     let redacted = infrastructure::redact::redact(&raw);
-    if redacted.len() > 512 {
-        redacted[..512].to_string()
-    } else {
-        redacted
-    }
+    crate::util::truncate_utf8(&redacted, 512).to_string()
 }

@@ -1,4 +1,4 @@
-import { AlertCircle } from "lucide-react"
+import { AlertCircle, WifiOff } from "lucide-react"
 
 import { hostLetter } from "@/features/connections/host-appearance"
 import { cn } from "@/lib/utils"
@@ -10,6 +10,8 @@ type HostTileProps = {
   icon?: string | null
   selected?: boolean
   status: HostConnStatus
+  /** The session dropped (vs. a connect that failed). */
+  lost?: boolean
   title?: string
   onClick?: () => void
 }
@@ -20,10 +22,12 @@ export function HostTile({
   icon,
   selected,
   status,
+  lost,
   title,
   onClick,
 }: HostTileProps) {
-  const connecting = status === "connecting"
+  const reconnecting = status === "reconnecting"
+  const connecting = status === "connecting" || reconnecting
   const connected = status === "connected"
   const errored = status === "error"
   const showWave = connecting
@@ -107,12 +111,22 @@ export function HostTile({
             aria-hidden
           />
         )}
+        {reconnecting && (
+          <span
+            className="absolute -right-0.5 -bottom-0.5 z-20 size-2.5 animate-pulse rounded-full border-2 border-sidebar bg-amber-400"
+            aria-hidden
+          />
+        )}
         {errored && (
           <span
             className="absolute -top-1 -right-1 z-20 flex size-4 items-center justify-center rounded-full bg-background text-destructive shadow"
-            title="Connection failed"
+            title={lost ? "Connection lost" : "Connection failed"}
           >
-            <AlertCircle className="size-3.5" strokeWidth={2.5} />
+            {lost ? (
+              <WifiOff className="size-3" strokeWidth={2.5} />
+            ) : (
+              <AlertCircle className="size-3.5" strokeWidth={2.5} />
+            )}
           </span>
         )}
       </button>

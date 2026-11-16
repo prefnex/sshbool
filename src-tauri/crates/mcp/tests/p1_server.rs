@@ -75,8 +75,8 @@ async fn test_tools_list_in_read_only_mode_contains_only_safe_tools() {
 
     assert_eq!(
         tools.len(),
-        28,
-        "Expected exactly 28 safe tools in read_only mode"
+        26,
+        "Expected exactly 26 safe tools in read_only mode"
     );
 
     let dangerous_names = [

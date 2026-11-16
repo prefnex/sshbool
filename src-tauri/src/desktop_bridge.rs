@@ -1,6 +1,7 @@
 //! Desktop WebSocket Bridge for in-app HTML5 Canvas Remote Desktop.
 //!
-//! 1. VNC mode: transparent loopback WebSocket proxy to SSH tunnel (noVNC).
+//! 1. VNC mode: loopback WebSocket proxy to SSH tunnel (noVNC). When a password is known the
+//!    bridge performs VNC authentication itself, so the password never reaches the webview.
 //! 2. RDP mode: Guacamole WebSocket bridge → guacd → RDP over SSH tunnel.
 
 use std::collections::HashMap;
@@ -17,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::guacamole_protocol::{to_instruction, Parser};
 use crate::guacamole_token::decrypt_token;
+use crate::vnc_auth;
 
 pub static DESKTOP_BRIDGES: LazyLock<DesktopBridgeManager> =
     LazyLock::new(DesktopBridgeManager::new);
@@ -83,7 +85,15 @@ impl DesktopBridgeManager {
     }
 
     /// Start VNC mode bridge using loopback tokio-tungstenite WebSocket.
-    pub async fn start_vnc(&self, session_id: String, target_tcp_port: u16) -> Result<u16, String> {
+    ///
+    /// Returns the WebSocket port and a random access token the client must present as
+    /// `?token=` — without it any local process could attach to the (pre-authenticated) desktop.
+    pub async fn start_vnc(
+        &self,
+        session_id: String,
+        target_tcp_port: u16,
+        password: Option<zeroize::Zeroizing<String>>,
+    ) -> Result<(u16, String), String> {
         self.stop(&session_id).await;
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -98,6 +108,10 @@ impl DesktopBridgeManager {
             map.insert(session_id.clone(), shutdown_tx);
         }
 
+        let access_token = vnc_auth::random_token();
+        let expected = Arc::new(access_token.clone());
+        let password = Arc::new(password);
+
         tokio::spawn(async move {
             info!(
                 "DesktopBridge (VNC): active on 127.0.0.1:{ws_port} -> 127.0.0.1:{target_tcp_port}"
@@ -111,7 +125,12 @@ impl DesktopBridgeManager {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((stream, _)) => {
-                                tokio::spawn(handle_vnc_connection(stream, target_tcp_port));
+                                tokio::spawn(handle_vnc_connection(
+                                    stream,
+                                    target_tcp_port,
+                                    expected.clone(),
+                                    password.clone(),
+                                ));
                             }
                             Err(e) => {
                                 warn!("DesktopBridge: accept error: {e}");
@@ -123,7 +142,7 @@ impl DesktopBridgeManager {
             }
         });
 
-        Ok(ws_port)
+        Ok((ws_port, access_token))
     }
 
     /// Stop an active bridge by session ID.
@@ -370,8 +389,32 @@ fn build_handshake_reply(settings: &HashMap<String, String>, arg_names: &[String
     out
 }
 
-async fn handle_vnc_connection(stream: TcpStream, target_tcp_port: u16) {
-    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+#[allow(clippy::result_large_err)]
+async fn handle_vnc_connection(
+    stream: TcpStream,
+    target_tcp_port: u16,
+    expected_token: Arc<String>,
+    password: Arc<Option<zeroize::Zeroizing<String>>>,
+) {
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        stream,
+        move |req: &Request, response: Response| {
+            let presented = extract_token_from_request(req).unwrap_or_default();
+            if vnc_auth::tokens_match(&presented, &expected_token) {
+                Ok(response)
+            } else {
+                warn!("DesktopBridge (VNC): rejected WebSocket without a valid token");
+                let mut reject =
+                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                        "invalid token".into(),
+                    ));
+                *reject.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+                Err(reject)
+            }
+        },
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(e) => {
             warn!("DesktopBridge: WebSocket handshake failed: {e}");
@@ -387,8 +430,30 @@ async fn handle_vnc_connection(stream: TcpStream, target_tcp_port: u16) {
         }
     };
 
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (mut ws_sender, ws_receiver) = ws_stream.split();
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+    let mut ws_reader = vnc_auth::WsReader::new(ws_receiver);
+
+    if let Err(e) = vnc_auth::handshake(
+        &mut ws_reader,
+        &mut ws_sender,
+        &mut tcp_read,
+        &mut tcp_write,
+        password.as_ref().as_ref().map(|p| p.as_str()),
+    )
+    .await
+    {
+        warn!("DesktopBridge (VNC): handshake failed: {e}");
+        let _ = ws_sender.send(Message::Close(None)).await;
+        return;
+    }
+
+    // Bytes the client sent after the handshake but that we already pulled off the socket.
+    let leftover = ws_reader.take_buffered();
+    if !leftover.is_empty() && tcp_write.write_all(&leftover).await.is_err() {
+        return;
+    }
+    let mut ws_receiver = ws_reader.into_inner();
 
     let ws_to_tcp = async {
         while let Some(msg_res) = ws_receiver.next().await {

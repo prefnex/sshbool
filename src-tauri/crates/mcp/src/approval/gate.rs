@@ -94,11 +94,7 @@ fn preview_text(tool_name: &str, args: &Value) -> String {
         _ => {
             let raw = args.to_string();
             let redacted = redact(&raw);
-            if redacted.len() > PREVIEW_MAX_BYTES {
-                redacted[..PREVIEW_MAX_BYTES].to_string()
-            } else {
-                redacted
-            }
+            crate::util::truncate_utf8(&redacted, PREVIEW_MAX_BYTES).to_string()
         }
     }
 }
@@ -148,7 +144,7 @@ async fn build_write_preview(
         "write_file" => {
             let new_content = args["content"].as_str()?;
             let old = exec
-                .sftp_read_preview(host_id, path, 256 * 1024)
+                .sftp_read_preview(host_id, path, 256 * 1024, false)
                 .await
                 .ok()
                 .and_then(|v| v["content"].as_str().map(str::to_string))
@@ -159,11 +155,16 @@ async fn build_write_preview(
             let target = args["target_content"].as_str()?;
             let replacement = args["replacement_content"].as_str()?;
             let old = exec
-                .sftp_read_preview(host_id, path, 256 * 1024)
+                .sftp_read_preview(host_id, path, 256 * 1024, false)
                 .await
                 .ok()
                 .and_then(|v| v["content"].as_str().map(str::to_string))?;
-            let new_content = old.replace(target, replacement);
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let new_content =
+                crate::tools::write::apply_edit(&old, target, replacement, replace_all).ok()?;
             Some(simple_unified_diff(&old, &new_content, path))
         }
         _ => None,

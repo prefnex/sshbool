@@ -18,9 +18,18 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
-pub use dangerous::{dangerous_tools, execute_dangerous_tool, validate_dangerous_tool};
-pub use safe::{execute_safe_tool, safe_tools};
+pub use dangerous::{
+    dangerous_tools, execute_dangerous_tool, read_task_logs_tool, validate_dangerous_tool,
+};
+pub use safe::execute_safe_tool;
 pub use write::{execute_write_tool, validate_write_tool, write_tools};
+
+/// Read-only tools available in every mode.
+pub fn safe_tools() -> Vec<ToolDefinition> {
+    let mut list = safe::safe_tools();
+    list.push(read_task_logs_tool());
+    list
+}
 
 /// Returns available tools for a client mode.
 pub fn get_tools_for_mode(mode: &str) -> Vec<ToolDefinition> {
@@ -83,6 +92,13 @@ pub async fn dispatch_tool_call(
             args,
         )
         .await?;
+        let grant =
+            crate::scope::resolve_host_in_scope(&ctx.pool, &ctx.client_id, &host_id).await?;
+        if !grant.exec_allowed {
+            return Err(McpError::CapabilityNotGranted(format!(
+                "Running commands is not allowed on host {host_id} for this client"
+            )));
+        }
         let _gate = gate_dangerous_tool(ctx, tool_name, args, &host_id).await?;
         execute_dangerous_tool(ctx, tool_name, args, &host_id).await
     } else if write_tools().iter().any(|t| t.name == tool_name) {
@@ -94,8 +110,35 @@ pub async fn dispatch_tool_call(
             args,
         )
         .await?;
+        let grant =
+            crate::scope::resolve_host_in_scope(&ctx.pool, &ctx.client_id, &host_id).await?;
+        // chown/kill run a command, so they need both capabilities.
+        let needs_exec = matches!(tool_name, "chown_path" | "kill_process");
+        if !grant.write_allowed || (needs_exec && !grant.exec_allowed) {
+            return Err(McpError::CapabilityNotGranted(format!(
+                "Changing files or processes is not allowed on host {host_id} for this client"
+            )));
+        }
+        if tool_name == "edit_file_delta" {
+            // Refuse edits that cannot apply before bothering the user with an approval.
+            if let (Some(exec), Some(path), Some(target), Some(replacement)) = (
+                ctx.executor(),
+                args.get("path").and_then(|v| v.as_str()),
+                args.get("target_content").and_then(|v| v.as_str()),
+                args.get("replacement_content").and_then(|v| v.as_str()),
+            ) {
+                let replace_all = args
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (content, _) = exec.sftp_read_full(&host_id, path).await?;
+                write::apply_edit(&content, target, replacement, replace_all)?;
+            }
+        }
         let _gate = gate_write_tool(ctx, tool_name, args, &host_id).await?;
         execute_write_tool(ctx, tool_name, args, &host_id).await
+    } else if tool_name == "read_task_logs" {
+        dangerous::read_task_logs(ctx, args).await
     } else {
         execute_safe_tool(ctx, tool_name, args).await
     }
@@ -129,5 +172,6 @@ pub fn exec_timeout_ms(args: &Value) -> u64 {
     args.get("timeout_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(60)
+        .clamp(1, 600)
         .saturating_mul(1000)
 }

@@ -205,7 +205,8 @@ export function HostRail() {
         </button>
 
         {hosts.map((host) => {
-          const status = byHost[host.id]?.status ?? "idle"
+          const hc = byHost[host.id]
+          const status = hc?.status ?? "idle"
           const Entry = labelMode ? HostRow : HostTile
           return (
             <Entry
@@ -215,14 +216,17 @@ export function HostRail() {
               icon={host.icon}
               selected={selectedHostId === host.id}
               status={status}
+              lost={hc?.lost}
               title={
                 status === "error"
-                  ? `${host.label} — ${byHost[host.id]?.error ?? "Connection failed"}`
+                  ? `${host.label} — ${hc?.error ?? "Connection failed"}`
                   : status === "connecting"
                     ? `${host.label} — Connecting…`
-                    : status === "connected"
-                      ? `${host.label} — Connected`
-                      : host.label
+                    : status === "reconnecting"
+                      ? `${host.label} — ${hc?.detail ?? "Reconnecting…"}`
+                      : status === "connected"
+                        ? `${host.label} — Connected`
+                        : host.label
               }
               onClick={() => {
                 setSelectedHostId(host.id)

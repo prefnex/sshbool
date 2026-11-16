@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Rust-Core-black?logo=rust" alt="Rust Core" />
   <img src="https://img.shields.io/badge/React-19-61DAFB?logo=react" alt="React 19" />
   <img src="https://img.shields.io/badge/Vite-Fast-646CFF?logo=vite" alt="Vite" />
-  <img src="https://img.shields.io/badge/Security-AES--256-green" alt="AES-256 Encrypted" />
+  <img src="https://img.shields.io/badge/Secrets-AES--256--GCM-green" alt="Secrets encrypted with AES-256-GCM" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0" /></a>
 </p>
 
@@ -56,9 +56,11 @@ Built with a **"Connect once, do everything"** architecture, SSHBool opens a sin
 
 - ⚡ **Native Performance:** Built on Rust and Tauri v2, bypassing the massive memory footprint of Electron. Starts in less than 800ms with a cold start connection time under 1.2s on LAN.
 - 🔒 **Security by Default:**
-  - All host profiles, settings, and metadata are saved locally in an encrypted database using **SQLCipher (AES-256)**.
-  - Cryptographic keys derived via **Argon2id** from your master password.
-  - Hardware key support (FIDO2/YubiKey) for unlocking and authenticating connections.
+  - Every secret (passwords, private keys, tokens) is sealed individually with **AES-256-GCM** before it is written to the local SQLite database.
+  - The data-encryption key is derived from your master password with **Argon2id** and only lives in memory while the vault is unlocked.
+  - Non-secret metadata (host names, addresses, settings) is stored in plain SQLite, protected by owner-only file permissions (`0600`/`0700` on Unix). Full-database encryption is not implemented yet.
+  - SSH host keys and RDP server certificates are pinned on first use; a changed key or certificate blocks the connection until you approve it.
+  - FIDO2/YubiKey and SSH-agent authentication are planned but not available yet.
 - 🌐 **Multiplexed SSH Transport:** Opens a single connection per host. Terminals, file operations, monitoring metrics, and DB queries run asynchronously over the same TCP socket.
 - 🖥️ **High-Performance Terminal:** An integrated, GPU-accelerated console powered by **Xterm.js** with WebGL rendering for ultra-fast text outputs.
 - 📂 **Dual-Pane SFTP Client:** Side-by-side local and remote file explorers supporting drag-and-drop actions, download/upload queues, and transfer status monitoring.
@@ -74,7 +76,7 @@ Built with a **"Connect once, do everything"** architecture, SSHBool opens a sin
 - **Frontend Core:** React 19 + TypeScript + Vite
 - **State & Query Caching:** Zustand + TanStack Query v5
 - **Styling & UI:** TailwindCSS v4 + Base UI
-- **Local Database:** SQLCipher (SQLite with AES-256 at-rest encryption)
+- **Local Database:** SQLite (secrets sealed with AES-256-GCM at the application layer)
 - **SSH Transport:** russh (Async SSH client in Rust)
 - **Terminal & Editor:** Xterm.js & Monaco Editor
 
@@ -123,7 +125,7 @@ Make sure you have the following installed on your machine:
 
 ## 📂 Project Blueprint
 
-For in-depth architectural documents, data schemas, and the development roadmap, refer to the [`docs/README.md`](docs/README.md) file.
+For the security model and how to report vulnerabilities, see [`SECURITY.md`](SECURITY.md).
 
 ---
 
