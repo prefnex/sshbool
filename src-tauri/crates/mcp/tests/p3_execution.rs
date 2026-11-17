@@ -57,13 +57,13 @@ fn test_ctx(pool: &SqlitePool) -> ToolCallContext {
 #[tokio::test]
 async fn test_dangerous_tool_catalog_availability_in_full_mode() {
     let read_only_tools = get_tools_for_mode("read_only");
-    assert_eq!(read_only_tools.len(), 28);
+    assert_eq!(read_only_tools.len(), 26);
 
     let assisted_tools = get_tools_for_mode("assisted");
-    assert_eq!(assisted_tools.len(), 36); // 28 + 8
+    assert_eq!(assisted_tools.len(), 34); // 26 + 8
 
     let full_tools = get_tools_for_mode("full");
-    assert_eq!(full_tools.len(), 46); // 28 + 8 + 10
+    assert_eq!(full_tools.len(), 42); // 26 + 8 + 8
 
     let names: Vec<String> = full_tools.into_iter().map(|t| t.name).collect();
     assert!(names.contains(&"exec_command".to_string()));

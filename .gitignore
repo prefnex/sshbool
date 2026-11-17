@@ -34,3 +34,4 @@ src-tauri/target
 .agents/
 .claude/
 
+stderr.log

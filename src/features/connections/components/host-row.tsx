@@ -1,4 +1,4 @@
-import { AlertCircle } from "lucide-react"
+import { AlertCircle, WifiOff } from "lucide-react"
 
 import { hostLetter } from "@/features/connections/host-appearance"
 import { cn } from "@/lib/utils"
@@ -10,6 +10,8 @@ type HostRowProps = {
   icon?: string | null
   selected?: boolean
   status: HostConnStatus
+  /** The session dropped (vs. a connect that failed). */
+  lost?: boolean
   title?: string
   onClick?: () => void
 }
@@ -24,10 +26,12 @@ export function HostRow({
   icon,
   selected,
   status,
+  lost,
   title,
   onClick,
 }: HostRowProps) {
-  const connecting = status === "connecting"
+  const reconnecting = status === "reconnecting"
+  const connecting = status === "connecting" || reconnecting
   const connected = status === "connected"
   const errored = status === "error"
   const hasIcon = !!icon
@@ -70,7 +74,10 @@ export function HostRow({
 
         {connecting && (
           <span
-            className="size-1.5 shrink-0 animate-pulse rounded-full bg-sky-400"
+            className={cn(
+              "size-1.5 shrink-0 animate-pulse rounded-full",
+              reconnecting ? "bg-amber-400" : "bg-sky-400"
+            )}
             aria-hidden
           />
         )}
@@ -80,13 +87,20 @@ export function HostRow({
             aria-hidden
           />
         )}
-        {errored && (
-          <AlertCircle
-            className="size-3.5 shrink-0 text-destructive"
-            strokeWidth={2.5}
-            aria-hidden
-          />
-        )}
+        {errored &&
+          (lost ? (
+            <WifiOff
+              className="size-3.5 shrink-0 text-destructive"
+              strokeWidth={2.5}
+              aria-hidden
+            />
+          ) : (
+            <AlertCircle
+              className="size-3.5 shrink-0 text-destructive"
+              strokeWidth={2.5}
+              aria-hidden
+            />
+          ))}
       </button>
     </div>
   )

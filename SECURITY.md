@@ -21,11 +21,10 @@ Instead, please report them by sending an email to our security team or the main
 
 SSHBool is designed with a defense-in-depth approach to protect user credentials, connections, and metadata:
 
-- **Local Encryption at Rest:** Sensitive credentials, private keys, and secrets stored in the local SQLite database are individually encrypted at rest using application-layer AEAD (AES-256-GCM) with Data Encryption Keys (DEK) derived from the Master Password via Argon2id.
+- **Local Encryption at Rest:** Sensitive credentials, private keys, and secrets stored in the local SQLite database are individually encrypted at rest using application-layer AEAD (AES-256-GCM) with Data Encryption Keys (DEK) derived from the Master Password via Argon2id. The database file itself is **not** encrypted: non-secret metadata (host labels, addresses, settings) is readable by anyone with access to your user account, and is protected only by owner-only file permissions.
 - **Secure Memory:** Sensitive keys and passwords are held in zeroizing wrappers (`secrecy`/`zeroize`) that scrub memory upon drop, minimizing exposure to memory-reading malware.
 - **Biometric Integration:** Support for OS-level biometric authentication (Windows Hello, TouchID, Linux Secret Service) to securely unwrap the Data Encryption Key (DEK).
 - **Capability Sandboxing:** The Tauri frontend is strictly sandboxed. There is no ambient filesystem or shell access from the webview; all privileged actions route through strictly-typed Rust commands.
-- **Connection Integrity:** Strict host-key verification (TOFU/strict modes) prevents MITM attacks on SSH connections.
+- **Connection Integrity:** Strict host-key verification (TOFU/strict modes) prevents MITM attacks on SSH connections. RDP server certificates are pinned on first use through the SSH tunnel, and a changed certificate blocks the connection until the user trusts it.
+- **Secrets stay in Rust:** RDP passwords travel to guacd inside an authenticated token keyed per process, and VNC authentication is answered by the Rust bridge, so saved passwords are not handed to the webview. Database CLI passwords are passed to the remote shell on stdin, never as command-line arguments.
 - **Network Security:** All external API calls (sync, AI, updates) enforce full TLS certificate chain validation.
-
-For more detailed information regarding the security architecture, threat model, and key hierarchy, please refer to the internal documentation located in `docs/22-security.md`.

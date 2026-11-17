@@ -228,6 +228,21 @@ pub async fn effective_tier(state: &AppState) -> String {
     }
 }
 
+/// Features every install gets, licensed or not. The MCP server is free: agents
+/// still need per-client pairing, host grants and approvals (see crates/mcp).
+const FREE_FEATURES: &[&str] = &[
+    "core_ssh",
+    "sftp",
+    "terminal",
+    "keys",
+    "vault",
+    "mcp_server",
+];
+
+fn is_free_feature(feature: &str) -> bool {
+    FREE_FEATURES.contains(&feature)
+}
+
 pub async fn active_features(state: &AppState) -> Vec<String> {
     let row: Option<(Option<String>, Option<String>)> =
         sqlx::query_as("SELECT token_blob, features_json FROM license_state WHERE id = 'current'")
@@ -244,13 +259,7 @@ pub async fn active_features(state: &AppState) -> Vec<String> {
     let is_activated =
         !token_blob.is_empty() && token_blob != "activated" && token_blob.contains('.');
     if !is_activated {
-        return vec![
-            "core_ssh".to_string(),
-            "sftp".to_string(),
-            "terminal".to_string(),
-            "keys".to_string(),
-            "vault".to_string(),
-        ];
+        return FREE_FEATURES.iter().map(|f| f.to_string()).collect();
     }
 
     if let Ok(parsed_feats) = serde_json::from_str::<Vec<String>>(&features_json) {
@@ -278,11 +287,7 @@ pub async fn active_features(state: &AppState) -> Vec<String> {
                 }
             }
         }
-        mapped.push("core_ssh".to_string());
-        mapped.push("sftp".to_string());
-        mapped.push("terminal".to_string());
-        mapped.push("keys".to_string());
-        mapped.push("vault".to_string());
+        mapped.extend(FREE_FEATURES.iter().map(|f| f.to_string()));
         mapped.sort();
         mapped.dedup();
         return mapped;
@@ -307,12 +312,7 @@ pub async fn active_features(state: &AppState) -> Vec<String> {
 
 /// Soft gate helper — Free keeps core SSH; Pro/Team unlock sync/team/paid plugins.
 pub async fn require_feature(state: &AppState, feature: &str) -> Result<(), AppError> {
-    if matches!(feature, "core_ssh" | "sftp" | "terminal" | "keys" | "vault") {
-        return Ok(());
-    }
-    // Local dev builds: MCP server must be testable without a Pro license token.
-    #[cfg(debug_assertions)]
-    if feature == "mcp_server" {
+    if is_free_feature(feature) {
         return Ok(());
     }
     let feats = active_features(state).await;

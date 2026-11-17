@@ -19,6 +19,7 @@ import { HOST_RAIL_SIZING, useLayoutStore } from "@/stores/layout.store"
 
 import { LicenseSettings } from "@/features/license/components/license-settings"
 import { AboutSettings } from "@/features/productivity/components/settings/about-settings"
+import { BackgroundSettings } from "@/features/productivity/components/settings/background-settings"
 import { UpdatesSettings } from "@/features/productivity/components/settings/updates-settings"
 import { ConnectionsSettings } from "@/features/productivity/components/settings/connections-settings"
 import { EditorSettingsPanel } from "@/features/productivity/components/settings/editor-settings-panel"
@@ -41,6 +42,7 @@ const SECTIONS = [
   "editor",
   "sftp",
   "connections",
+  "background",
   "security",
   "license",
   // "team",
@@ -178,6 +180,7 @@ export function SettingsPanel({ initial = "general" }: { initial?: Section }) {
         {section === "about" && <AboutSettings />}
         {section === "updates" && <UpdatesSettings />}
         {section === "security" && <SecuritySettings />}
+        {section === "background" && <BackgroundSettings />}
         {section === "terminal" && <TerminalSettings />}
         {section === "connections" && <ConnectionsSettings />}
         {section === "editor" && <EditorSettingsPanel />}

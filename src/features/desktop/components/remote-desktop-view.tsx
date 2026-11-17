@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query"
+import { confirm } from "@tauri-apps/plugin-dialog"
 import {
   ExternalLink,
   Eye,
@@ -189,6 +190,28 @@ export function RemoteDesktopView({ hostId }: { hostId: string | null }) {
     }
   }
 
+  /**
+   * The backend pins each RDP server certificate on first use (no prompt, so auto-login keeps
+   * working). When a pinned certificate changes we ask once before trusting the new one.
+   */
+  async function offerTrustNewRdpCert(
+    err: string,
+    targetPort: number
+  ): Promise<boolean> {
+    if (!hostId || !err.includes("RDP_CERT_MISMATCH")) return false
+    const details = err.replace(/^.*RDP_CERT_MISMATCH:\s*/s, "")
+    const trust = await confirm(
+      `${details}\n\nOnly continue if you know why the certificate changed. Trust the new certificate?`,
+      { title: "RDP certificate changed", kind: "warning" }
+    )
+    if (!trust) return false
+    await ipc.rdpCertForget(hostId, remoteTarget, targetPort)
+    addLog(
+      "Old RDP certificate forgotten — reconnecting and pinning the new one..."
+    )
+    return true
+  }
+
   async function connectInAppDesktop() {
     if (!host || !hostId || inAppConnecting) return
     setInAppConnecting(true)
@@ -244,22 +267,25 @@ export function RemoteDesktopView({ hostId }: { hostId: string | null }) {
         )
         toast.success("Embedded RDP Ready", "Guacamole session active")
       } else {
+        const typedPassword = resolveVaultPassword(password) || undefined
         const session = await ipc.desktopInappConnect(
           hostId,
           remoteTarget,
           targetPort,
-          tab
+          tab,
+          typedPassword
         )
-        const wsUrl = session.wsUrl || `ws://127.0.0.1:${session.wsPort}`
         setInAppSession({
           sessionId: session.sessionId,
           wsPort: session.wsPort,
-          wsUrl,
+          wsUrl: session.wsUrl,
           protocol: "vnc",
-          vncPassword:
-            resolveVaultPassword(password, session.vaultPassword) || undefined,
+          // The bridge authenticates with the vault password; noVNC only needs one otherwise.
+          vncPassword: session.bridgeAuth ? undefined : typedPassword,
         })
-        addLog(`VNC WebSocket bridge active on ${wsUrl}`)
+        addLog(
+          `VNC WebSocket bridge active on 127.0.0.1:${session.wsPort}${session.bridgeAuth ? " (authenticated by SSHBool)" : ""}`
+        )
         toast.success("Embedded VNC Ready", "noVNC stream active")
       }
 
@@ -270,6 +296,10 @@ export function RemoteDesktopView({ hostId }: { hostId: string | null }) {
       addLog(`Error connecting in-app desktop: ${err}`)
       if (tab === "rdp" && /guacd/i.test(err)) {
         setGuacdSetupHint(err)
+      }
+      if (tab === "rdp" && (await offerTrustNewRdpCert(err, targetPort))) {
+        setTimeout(() => void connectInAppDesktop(), 0)
+        return
       }
       toast.error("In-App Desktop Error", err)
     } finally {
@@ -383,6 +413,10 @@ export function RemoteDesktopView({ hostId }: { hostId: string | null }) {
       setStatus("error")
       const err = (e as Error)?.message ?? "Failed to launch native RDP"
       addLog(`Error launching RDP: ${err}`)
+      if (await offerTrustNewRdpCert(err, targetPort)) {
+        setTimeout(() => void launchNativeRdp(), 0)
+        return
+      }
       toast.error("RDP Launch Failed", err)
     } finally {
       launchingRef.current = false

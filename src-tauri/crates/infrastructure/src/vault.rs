@@ -274,3 +274,80 @@ impl VaultService {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn fresh_vault() -> (Arc<VaultService>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sshbool-vault-test-{}", Uuid::now_v7()));
+        let pool = crate::db::open_pool(&dir.join("test.db"))
+            .await
+            .expect("pool");
+        crate::db::migrate(&pool).await.expect("migrate");
+        (VaultService::new(pool), dir)
+    }
+
+    #[tokio::test]
+    async fn seal_open_lock_unlock_roundtrip() {
+        let (vault, dir) = fresh_vault().await;
+        assert!(!vault.status().await.unwrap().initialized);
+        vault.init("correct horse battery").await.expect("init");
+
+        let (ct, nonce) = vault.seal_secret(b"s3cret", "cred:1").await.unwrap();
+        assert_ne!(
+            ct,
+            b"s3cret".to_vec(),
+            "ciphertext must not be the plaintext"
+        );
+        assert_eq!(
+            vault.open_secret(&ct, &nonce, "cred:1").await.unwrap(),
+            b"s3cret"
+        );
+
+        vault.lock().await.unwrap();
+        assert!(vault.status().await.unwrap().locked);
+        assert!(matches!(
+            vault.open_secret(&ct, &nonce, "cred:1").await,
+            Err(DomainError::Unauthorized(_))
+        ));
+
+        assert!(vault.unlock("wrong password!").await.is_err());
+        assert!(vault.status().await.unwrap().locked);
+
+        vault.unlock("correct horse battery").await.expect("unlock");
+        assert_eq!(
+            vault.open_secret(&ct, &nonce, "cred:1").await.unwrap(),
+            b"s3cret"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn aad_binds_ciphertext_to_its_record() {
+        let (vault, dir) = fresh_vault().await;
+        vault.init("correct horse battery").await.unwrap();
+        let (ct, nonce) = vault.seal_secret(b"pw", "cred:a").await.unwrap();
+        // Swapping a ciphertext into another row must fail authentication.
+        assert!(vault.open_secret(&ct, &nonce, "cred:b").await.is_err());
+        let mut tampered = ct.clone();
+        tampered[0] ^= 0x01;
+        assert!(vault
+            .open_secret(&tampered, &nonce, "cred:a")
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn init_rules() {
+        let (vault, dir) = fresh_vault().await;
+        assert!(vault.init("short").await.is_err());
+        vault.init("long enough pw").await.unwrap();
+        assert!(matches!(
+            vault.init("another long pw").await,
+            Err(DomainError::Conflict(_))
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

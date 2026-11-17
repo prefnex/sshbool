@@ -2,4 +2,4 @@
 
 mod manager;
 
-pub use manager::{ConnectionManager, SftpEntry};
+pub use manager::{ConnectionManager, ExecCapture, SftpEntry};

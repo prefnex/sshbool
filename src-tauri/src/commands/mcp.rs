@@ -7,7 +7,7 @@ use mcp::repo::clients::{grant_host_to_client, list_clients};
 use mcp::{McpNotifier, McpServerHandle};
 use serde_json::{json, Value};
 use std::sync::{Arc, LazyLock};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 
 use crate::commands::license::require_feature;
@@ -23,6 +23,28 @@ struct AppNotifier {
 impl McpNotifier for AppNotifier {
     fn approval_requested(&self, req: &mcp::ApprovalRequest) {
         let _ = self.app_handle.emit("mcp://approval-request", req);
+        // The approval dialog lives in the window; if SSHBool sits in the tray the user would
+        // never see it and the agent's call would just time out.
+        use tauri_plugin_notification::NotificationExt;
+        let target = req.host_label.as_deref().unwrap_or("a host");
+        let body = match req.command_preview.as_deref() {
+            Some(cmd) if !cmd.is_empty() => {
+                format!(
+                    "{} on {target}: {}",
+                    req.tool,
+                    mcp::util::truncate_utf8(cmd, 120)
+                )
+            }
+            _ => format!("{} on {target}", req.tool),
+        };
+        let _ = self
+            .app_handle
+            .notification()
+            .builder()
+            .title(format!("{} needs your approval", req.client_name))
+            .body(body)
+            .show();
+        crate::tray::show_main(&self.app_handle);
     }
     fn call_recorded(&self, entry: &mcp::CallLogEntry) {
         let _ = self.app_handle.emit("mcp://call-recorded", entry);
@@ -42,42 +64,33 @@ fn db(e: sqlx::Error) -> AppError {
     }
 }
 
-#[tauri::command]
-pub async fn mcp_server_start(
-    app: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    port: Option<u16>,
-) -> Result<Value, AppError> {
-    require_feature(&state, "mcp_server").await?;
+const DEFAULT_PORT: u16 = 47821;
+/// How long a tool call waits for the user to approve it.
+const APPROVAL_TIMEOUT_MS: u64 = 120_000;
 
+/// Start the loopback server (no-op if already running). Returns the bound port.
+async fn start_server(app: AppHandle, state: Arc<AppState>, port: u16) -> Result<u16, AppError> {
     let mut lock = MCP_HANDLE.lock().await;
     if let Some(ref handle) = *lock {
         if handle.is_running() {
-            return Ok(json!({
-                "enabled": true,
-                "port": handle.port(),
-                "status": "running"
-            }));
+            return Ok(handle.port());
         }
         // Drop stale handle from a prior stop/crash so the port can be rebound.
         *lock = None;
     }
 
-    let bind_port = port.unwrap_or(47821);
-    let loopback = LoopbackAddr::new(bind_port).map_err(|e| AppError::Validation {
+    let loopback = LoopbackAddr::new(port).map_err(|e| AppError::Validation {
         field: "port".into(),
         message: e.to_string(),
     })?;
-
     let config = ServerConfig {
         bind_addr: loopback,
         ruleset_version: 1,
-        approval_timeout_ms: 60000,
+        approval_timeout_ms: APPROVAL_TIMEOUT_MS,
     };
-
     let notifier = Arc::new(AppNotifier { app_handle: app });
     let executor = Arc::new(crate::mcp_executor::AppMcpExecutor::new(
-        state.inner().clone(),
+        state.clone(),
         mcp::runtime::McpRuntimeState::global(),
     ));
     let handle = McpServerHandle::start(config, state.vault.pool().clone(), notifier, executor)
@@ -85,23 +98,89 @@ pub async fn mcp_server_start(
         .map_err(|e| AppError::Internal {
             message: format!("Failed to start MCP server: {e}"),
         })?;
-
     let port = handle.port();
     *lock = Some(handle);
+    Ok(port)
+}
 
+/// Remember whether the server should run, so it comes back after a restart.
+async fn persist_enabled(state: &AppState, enabled: bool, port: Option<u16>) {
+    let now = chrono::Utc::now().timestamp_millis();
+    let result = sqlx::query(
+        "UPDATE mcp_server_state SET enabled = ?, autostart = ?, port = COALESCE(?, port), \
+         last_started_at = CASE WHEN ? THEN ? ELSE last_started_at END, \
+         last_stopped_at = CASE WHEN ? THEN last_stopped_at ELSE ? END, updated_at = ? \
+         WHERE id = 'current'",
+    )
+    .bind(enabled)
+    .bind(enabled)
+    .bind(port.map(i64::from))
+    .bind(enabled)
+    .bind(now)
+    .bind(enabled)
+    .bind(now)
+    .bind(now)
+    .execute(state.vault.pool())
+    .await;
+    if let Err(e) = result {
+        tracing::warn!("could not persist MCP server state: {e}");
+    }
+}
+
+/// On launch, restart the MCP server if the user left it on. Agents keep working while
+/// SSHBool runs in the tray.
+pub fn autostart(app: &tauri::App) {
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = handle
+            .try_state::<Arc<AppState>>()
+            .map(|s| s.inner().clone())
+        else {
+            return;
+        };
+        let row: Option<(i64, i64)> =
+            sqlx::query_as("SELECT enabled, port FROM mcp_server_state WHERE id = 'current'")
+                .fetch_optional(state.vault.pool())
+                .await
+                .unwrap_or(None);
+        let Some((1, port)) = row else {
+            return;
+        };
+        // Tool calls wait for the vault: report it locked until the user unlocks.
+        let locked = state.vault.status().await.map(|s| s.locked).unwrap_or(true);
+        mcp::runtime::McpRuntimeState::global().set_vault_locked(locked);
+        let port = u16::try_from(port).unwrap_or(DEFAULT_PORT);
+        match start_server(handle.clone(), state, port).await {
+            Ok(p) => tracing::info!("MCP server restored on 127.0.0.1:{p}"),
+            Err(e) => tracing::warn!("MCP server autostart failed: {e}"),
+        }
+    });
+}
+
+#[tauri::command]
+pub async fn mcp_server_start(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    port: Option<u16>,
+) -> Result<Value, AppError> {
+    require_feature(&state, "mcp_server").await?;
+    let port = start_server(app, state.inner().clone(), port.unwrap_or(DEFAULT_PORT)).await?;
+    persist_enabled(&state, true, Some(port)).await;
     Ok(json!({
         "enabled": true,
         "port": port,
-        "status": "started"
+        "status": "running"
     }))
 }
 
 #[tauri::command]
-pub async fn mcp_server_stop(_state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
+pub async fn mcp_server_stop(state: State<'_, Arc<AppState>>) -> Result<(), AppError> {
     let mut lock = MCP_HANDLE.lock().await;
     if let Some(handle) = lock.take() {
         handle.stop();
     }
+    drop(lock);
+    persist_enabled(&state, false, None).await;
     Ok(())
 }
 
@@ -110,7 +189,7 @@ pub async fn mcp_server_status(_state: State<'_, Arc<AppState>>) -> Result<Value
     let lock = MCP_HANDLE.lock().await;
     let (running, port) = match &*lock {
         Some(h) => (h.is_running(), h.port()),
-        None => (false, 47821),
+        None => (false, DEFAULT_PORT),
     };
     let runtime = mcp::runtime::McpRuntimeState::global();
 

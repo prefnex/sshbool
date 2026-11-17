@@ -29,6 +29,8 @@ import { UnlockScreen } from "@/features/vault/components/unlock-screen"
 import { useEvent } from "@/hooks/use-event"
 import { useTaskbarTransferProgress } from "@/hooks/use-taskbar-transfer-progress"
 import { useTransferCloseGuard } from "@/hooks/use-transfer-close-guard"
+import { useTrayEvents } from "@/hooks/use-tray-events"
+import { useConnectivity } from "@/hooks/use-connectivity"
 import { useTransfersSync } from "@/hooks/use-transfers-sync"
 import { ipc } from "@/lib/ipc/commands"
 import { cn } from "@/lib/utils"
@@ -173,6 +175,8 @@ export function App() {
 
   useTransfersSync(unlocked)
   useTransferCloseGuard(unlocked)
+  useTrayEvents()
+  useConnectivity()
   useTaskbarTransferProgress(unlocked)
 
   // Deep link activation listener (sshbool://activate)

@@ -1,11 +1,22 @@
 import { create } from "zustand"
 
-export type HostConnStatus = "idle" | "connecting" | "connected" | "error"
+export type HostConnStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  /** The session dropped on its own and SSHBool is trying to restore it. */
+  | "reconnecting"
+  | "error"
 
 export type HostConnection = {
   status: HostConnStatus
   sessionId?: string
   error?: string
+  /** True when the error is a dropped connection (vs. a failed connect). */
+  lost?: boolean
+  /** While reconnecting: why the session dropped / what we are waiting for. */
+  detail?: string
+  attempt?: number
 }
 
 type ConnectionState = {
@@ -13,7 +24,8 @@ type ConnectionState = {
   get: (hostId: string) => HostConnection
   setConnecting: (hostId: string) => void
   setConnected: (hostId: string, sessionId: string) => void
-  setError: (hostId: string, error: string) => void
+  setError: (hostId: string, error: string, opts?: { lost?: boolean }) => void
+  setReconnecting: (hostId: string, detail: string, attempt?: number) => void
   setIdle: (hostId: string) => void
   clearError: (hostId: string) => void
   isConnected: (hostId: string) => boolean
@@ -42,11 +54,18 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
         [hostId]: { status: "connected", sessionId },
       },
     })),
-  setError: (hostId, error) =>
+  setError: (hostId, error, opts) =>
     set((s) => ({
       byHost: {
         ...s.byHost,
-        [hostId]: { status: "error", error },
+        [hostId]: { status: "error", error, lost: opts?.lost },
+      },
+    })),
+  setReconnecting: (hostId, detail, attempt) =>
+    set((s) => ({
+      byHost: {
+        ...s.byHost,
+        [hostId]: { status: "reconnecting", detail, attempt },
       },
     })),
   setIdle: (hostId) =>

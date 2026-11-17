@@ -17,6 +17,7 @@ pub mod server;
 pub mod session;
 pub mod tools;
 pub mod transport;
+pub mod util;
 
 pub use config::{LoopbackAddr, ServerConfig};
 pub use error::McpError;

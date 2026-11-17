@@ -2,10 +2,23 @@ import { confirm } from "@tauri-apps/plugin-dialog"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { useEffect } from "react"
 
-/** Warn before closing while an update download/install is in progress. */
+import { ipc } from "@/lib/ipc/commands"
+
+/**
+ * Warn before closing while an update download/install is in progress.
+ * For the main window Rust owns close/quit (tray.rs), so we only report the busy state.
+ */
 export function useUpdateCloseGuard(active: boolean, isForced = false) {
   useEffect(() => {
-    if (!active) {
+    if (getCurrentWindow().label !== "main") return
+    void ipc.appBusySet("update", active).catch(() => {})
+    return () => {
+      void ipc.appBusySet("update", false).catch(() => {})
+    }
+  }, [active])
+
+  useEffect(() => {
+    if (!active || getCurrentWindow().label === "main") {
       return
     }
 

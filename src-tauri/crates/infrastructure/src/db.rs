@@ -1,5 +1,7 @@
-//! SQLite pool + migrations. Secrets columns are AEAD-encrypted with the vault DEK.
-//! PRAGMA key is applied when unlocking for SQLCipher-compatible builds; stock SQLite ignores it.
+//! SQLite pool + migrations.
+//!
+//! The database file itself is plain SQLite (no SQLCipher). Secret columns are sealed with
+//! AES-256-GCM using the vault DEK; everything else relies on owner-only file permissions.
 
 use std::path::{Path, PathBuf};
 
@@ -25,8 +27,7 @@ pub async fn open_pool(db_path: &Path) -> Result<SqlitePool, DomainError> {
         .await
         .map_err(|e| DomainError::Crypto(e.to_string()))?;
 
-    // Apply SQLCipher key if the linked sqlite supports it (no-op otherwise).
-    // Actual secret protection is AEAD at the application layer.
+    // Secret protection is AEAD at the application layer (see module docs).
     sqlx::query("PRAGMA journal_mode = WAL;")
         .execute(&pool)
         .await
@@ -125,6 +126,10 @@ const EMBEDDED_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0020_reapply_mcp",
         include_str!("../../../migrations/0019_mcp.sql"),
+    ),
+    (
+        "0021_rdp_known_certs",
+        include_str!("../../../migrations/0021_rdp_known_certs.sql"),
     ),
 ];
 

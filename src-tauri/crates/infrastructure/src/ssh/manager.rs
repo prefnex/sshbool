@@ -75,13 +75,78 @@ async fn set_shell_env(channel: &mut russh::Channel<client::Msg>) {
     }
 }
 
+/// Give up on a connection attempt (TCP + handshake + auth) after this long.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Keepalive used when the user has not configured one; with `keepalive_max = 3` a dead
+/// link (network down, server powered off) is detected in about a minute.
+const DEFAULT_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Backup sweep for sessions whose transport closed without a `disconnected` callback.
+const LOST_SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Output of [`ConnectionManager::exec_capture`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ExecCapture {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub exit_signal: Option<String>,
+    pub timed_out: bool,
+    pub truncated: bool,
+}
+
+/// An SSH session that ended without the user asking for it.
+#[derive(Clone, Debug)]
+pub struct SessionLost {
+    pub host_id: String,
+    pub session_id: String,
+    pub pane_ids: Vec<String>,
+    pub reason: String,
+}
+
 struct ClientHandler {
     expected_fp: Option<String>,
     learned_fp: Arc<Mutex<Option<(String, String, String)>>>,
+    /// Filled with the session id once the session is registered.
+    session_slot: Arc<std::sync::Mutex<Option<String>>>,
+    lost_tx: mpsc::UnboundedSender<(String, String)>,
+}
+
+fn describe_disconnect(reason: &client::DisconnectReason<russh::Error>) -> String {
+    match reason {
+        client::DisconnectReason::ReceivedDisconnect(info) => {
+            if info.message.trim().is_empty() {
+                format!("server closed the connection ({:?})", info.reason_code)
+            } else {
+                format!("server closed the connection: {}", info.message.trim())
+            }
+        }
+        client::DisconnectReason::Error(russh::Error::KeepaliveTimeout) => {
+            "server stopped responding (network down or server unreachable)".into()
+        }
+        client::DisconnectReason::Error(russh::Error::InactivityTimeout) => {
+            "connection timed out (no activity)".into()
+        }
+        client::DisconnectReason::Error(russh::Error::IO(e)) => format!("network error: {e}"),
+        client::DisconnectReason::Error(e) => format!("connection lost: {e}"),
+    }
 }
 
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let sid = self.session_slot.lock().ok().and_then(|slot| slot.clone());
+        if let Some(sid) = sid {
+            let _ = self.lost_tx.send((sid, describe_disconnect(&reason)));
+        }
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            client::DisconnectReason::Error(e) => Err(e),
+        }
+    }
 
     async fn check_server_key(
         &mut self,
@@ -155,6 +220,8 @@ pub struct ConnectionManager {
     scrollback: RwLock<HashMap<String, Vec<u8>>>,
     forward_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     forward_ports: RwLock<HashMap<String, u16>>,
+    lost_tx: mpsc::UnboundedSender<(String, String)>,
+    lost_rx: Mutex<mpsc::UnboundedReceiver<(String, String)>>,
 }
 
 const MAX_SCROLLBACK_BYTES: usize = 512_000;
@@ -162,6 +229,7 @@ const MAX_SCROLLBACK_BYTES: usize = 512_000;
 impl ConnectionManager {
     /// Create manager.
     pub fn new(vault: Arc<VaultService>) -> Arc<Self> {
+        let (lost_tx, lost_rx) = mpsc::unbounded_channel();
         Arc::new(Self {
             vault,
             sessions: RwLock::new(HashMap::new()),
@@ -171,6 +239,86 @@ impl ConnectionManager {
             scrollback: RwLock::new(HashMap::new()),
             forward_tasks: RwLock::new(HashMap::new()),
             forward_ports: RwLock::new(HashMap::new()),
+            lost_tx,
+            lost_rx: Mutex::new(lost_rx),
+        })
+    }
+
+    /// Wait for the next session that dropped on its own (network loss, server shutdown,
+    /// keepalive timeout...). Its panes and bookkeeping are already cleaned up when this
+    /// returns. Meant for a single long-running consumer.
+    pub async fn next_lost_session(&self) -> SessionLost {
+        let mut rx = self.lost_rx.lock().await;
+        loop {
+            tokio::select! {
+                Some((sid, reason)) = rx.recv() => {
+                    if let Some(ev) = self.mark_session_lost(&sid, reason).await {
+                        return ev;
+                    }
+                }
+                _ = tokio::time::sleep(LOST_SWEEP_EVERY) => {
+                    let closed: Vec<String> = {
+                        let sessions = self.sessions.read().await;
+                        sessions
+                            .iter()
+                            .filter(|(_, live)| {
+                                live.try_lock().map(|l| l.handle.is_closed()).unwrap_or(false)
+                            })
+                            .map(|(sid, _)| sid.clone())
+                            .collect()
+                    };
+                    for sid in closed {
+                        if let Some(ev) = self
+                            .mark_session_lost(&sid, "connection closed".into())
+                            .await
+                        {
+                            return ev;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Forget a session that is already dead. `None` if it was closed on purpose before.
+    async fn mark_session_lost(&self, session_id: &str, reason: String) -> Option<SessionLost> {
+        let live = self.sessions.write().await.remove(session_id)?;
+        let host_id = live.lock().await.host_id.clone();
+        {
+            let mut map = self.host_to_session.write().await;
+            if map.get(&host_id).map(String::as_str) == Some(session_id) {
+                map.remove(&host_id);
+            }
+        }
+        let pane_ids: Vec<String> = {
+            let mut panes = self.panes.write().await;
+            let ids: Vec<String> = panes
+                .iter()
+                .filter(|(_, p)| p.session_id == session_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ids {
+                panes.remove(id);
+            }
+            ids
+        };
+        {
+            let mut tx = self.pane_tx.write().await;
+            for id in &pane_ids {
+                tx.remove(id);
+            }
+        }
+        let _ = sqlx::query("UPDATE sessions SET ended_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().timestamp_millis())
+            .bind(session_id)
+            .execute(self.vault.pool())
+            .await;
+        tracing::warn!("SSH session {session_id} for host {host_id} lost: {reason}");
+        Some(SessionLost {
+            host_id,
+            session_id: session_id.to_string(),
+            pane_ids,
+            reason,
         })
     }
 
@@ -189,6 +337,13 @@ impl ConnectionManager {
         addr: &str,
         port: u16,
     ) -> Result<bool, DomainError> {
+        // `addr` is interpolated into a shell script: only allow hostname / IP characters.
+        if !is_safe_probe_addr(addr) {
+            return Err(DomainError::Validation {
+                field: "host".into(),
+                message: format!("invalid target host: {addr:?}"),
+            });
+        }
         let cmd = format!(
             "bash -lc 'if timeout 3 bash -c \"echo >/dev/tcp/{addr}/{port}\" 2>/dev/null; then echo SSHBOOL_OPEN; \
              elif ss -tln 2>/dev/null | grep -q \":{port} \"; then echo SSHBOOL_OPEN; \
@@ -262,52 +417,71 @@ impl ConnectionManager {
         .map_err(|e| DomainError::Crypto(e.to_string()))?;
 
         let learned_fp = Arc::new(Mutex::new(None));
-        let mut config = client::Config::default();
-        if let Some(secs) = read_setting_u64(self.vault.pool(), "connections.keepaliveSecs").await {
-            if secs > 0 {
-                config.keepalive_interval = Some(std::time::Duration::from_secs(secs));
-            }
-        }
+        let session_slot = Arc::new(std::sync::Mutex::new(None));
+        let keepalive_interval =
+            match read_setting_u64(self.vault.pool(), "connections.keepaliveSecs").await {
+                Some(0) => None,
+                Some(secs) => Some(std::time::Duration::from_secs(secs)),
+                None => Some(DEFAULT_KEEPALIVE),
+            };
+        let config = client::Config {
+            keepalive_interval,
+            keepalive_max: 3,
+            ..Default::default()
+        };
         let config = Arc::new(config);
         let handler = ClientHandler {
             expected_fp: known.as_ref().map(|k| k.0.clone()),
             learned_fp: learned_fp.clone(),
+            session_slot: session_slot.clone(),
+            lost_tx: self.lost_tx.clone(),
         };
 
-        let mut handle = if let Some(jump_id) = jump_host_id.filter(|s| !s.is_empty()) {
-            let jump_sid = Box::pin(self.session_open_inner(&jump_id, chain, None)).await?;
-            let jump_live = self.sessions.read().await.get(&jump_sid).cloned().ok_or(
-                DomainError::NotFound {
-                    entity: "session",
-                    id: Some(jump_sid),
-                },
-            )?;
-            let jump_guard = jump_live.lock().await;
-            let channel = jump_guard
-                .handle
-                .channel_open_direct_tcpip(hostname.as_str(), port as u32, "127.0.0.1", 0)
-                .await
-                .map_err(|e| DomainError::Conflict(format!("ProxyJump channel: {e}")))?;
-            drop(jump_guard);
-            let stream = channel.into_stream();
-            client::connect_stream(config, stream, handler)
-                .await
-                .map_err(|e| DomainError::Conflict(format!("ProxyJump connect: {e}")))?
-        } else {
-            client::connect(config, (hostname.as_str(), port), handler)
-                .await
-                .map_err(|e| DomainError::Conflict(format!("connection failed: {e}")))?
-        };
+        let connect_and_auth = async {
+            let mut handle = if let Some(jump_id) = jump_host_id.filter(|s| !s.is_empty()) {
+                let jump_sid = Box::pin(self.session_open_inner(&jump_id, chain, None)).await?;
+                let jump_live = self.sessions.read().await.get(&jump_sid).cloned().ok_or(
+                    DomainError::NotFound {
+                        entity: "session",
+                        id: Some(jump_sid),
+                    },
+                )?;
+                let jump_guard = jump_live.lock().await;
+                let channel = jump_guard
+                    .handle
+                    .channel_open_direct_tcpip(hostname.as_str(), port as u32, "127.0.0.1", 0)
+                    .await
+                    .map_err(|e| DomainError::Conflict(format!("ProxyJump channel: {e}")))?;
+                drop(jump_guard);
+                let stream = channel.into_stream();
+                client::connect_stream(config, stream, handler)
+                    .await
+                    .map_err(|e| DomainError::Conflict(format!("ProxyJump connect: {e}")))?
+            } else {
+                client::connect(config, (hostname.as_str(), port), handler)
+                    .await
+                    .map_err(|e| DomainError::Conflict(format!("connection failed: {e}")))?
+            };
 
-        let auth_ok = self
-            .authenticate(
-                &mut handle,
-                host_id,
-                &username,
-                &auth_method,
-                key_passphrase.as_deref(),
-            )
-            .await?;
+            let auth_ok = self
+                .authenticate(
+                    &mut handle,
+                    host_id,
+                    &username,
+                    &auth_method,
+                    key_passphrase.as_deref(),
+                )
+                .await?;
+            Ok::<_, DomainError>((handle, auth_ok))
+        };
+        let (handle, auth_ok) = tokio::time::timeout(CONNECT_TIMEOUT, connect_and_auth)
+            .await
+            .map_err(|_| {
+                DomainError::Conflict(format!(
+                    "connection timed out after {}s ({hostname}:{port} did not respond)",
+                    CONNECT_TIMEOUT.as_secs()
+                ))
+            })??;
 
         if !auth_ok {
             return Err(DomainError::Unauthorized("bad_password"));
@@ -363,6 +537,9 @@ impl ConnectionManager {
             host_id: host_id.to_string(),
         }));
         self.sessions.write().await.insert(session_id.clone(), live);
+        if let Ok(mut slot) = session_slot.lock() {
+            *slot = Some(session_id.clone());
+        }
         self.host_to_session
             .write()
             .await
@@ -712,15 +889,6 @@ impl ConnectionManager {
             .unwrap_or_default()
     }
 
-    /// Find an existing PTY pane for a host, if any.
-    pub async fn find_pane_for_host(&self, host_id: &str) -> Option<String> {
-        let panes = self.panes.read().await;
-        panes
-            .iter()
-            .find(|(_, pane)| pane.host_id == host_id)
-            .map(|(id, _)| id.clone())
-    }
-
     /// Open a PTY pane and retain scrollback without requiring the webview listener.
     pub async fn pane_open_mcp(
         self: &Arc<Self>,
@@ -741,50 +909,20 @@ impl ConnectionManager {
         Ok((pane_id, session_id))
     }
 
-    /// Write a command to a pane and capture output delta from scrollback.
-    pub async fn exec_in_pane(
-        &self,
-        pane_id: &str,
-        command: &str,
-        timeout_ms: u64,
-    ) -> Result<String, DomainError> {
-        let baseline = self.pane_scrollback_get(pane_id).await;
-        let baseline_len = baseline.len();
-
-        let mut cmd_bytes = command.as_bytes().to_vec();
-        cmd_bytes.push(b'\n');
-        self.pane_write(pane_id, &cmd_bytes).await?;
-
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(1000));
-        let mut last_len = baseline_len;
-        let mut stable_ticks = 0u32;
-
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let scrollback = self.pane_scrollback_get(pane_id).await;
-            if scrollback.len() == last_len {
-                stable_ticks += 1;
-                if stable_ticks >= 3 {
-                    break;
-                }
-            } else {
-                stable_ticks = 0;
-                last_len = scrollback.len();
-            }
-        }
-
-        let final_scrollback = self.pane_scrollback_get(pane_id).await;
-        let delta = if final_scrollback.len() > baseline_len {
-            String::from_utf8_lossy(&final_scrollback[baseline_len..]).to_string()
-        } else {
-            String::new()
-        };
-        Ok(delta)
-    }
-
     /// Run a non-interactive command on the host and return stdout+stderr.
     pub async fn exec_command(&self, host_id: &str, command: &str) -> Result<String, DomainError> {
+        self.exec_command_with_stdin(host_id, command, None).await
+    }
+
+    /// Like [`exec_command`](Self::exec_command) but writes `stdin` to the remote process and
+    /// then closes it. Use this for secrets: unlike command-line arguments, stdin is not visible
+    /// to other users on the server through `ps` / `/proc/<pid>/cmdline`.
+    pub async fn exec_command_with_stdin(
+        &self,
+        host_id: &str,
+        command: &str,
+        stdin: Option<&[u8]>,
+    ) -> Result<String, DomainError> {
         let session_id = self.session_open(host_id).await?;
         let live =
             self.sessions
@@ -808,6 +946,17 @@ impl ConnectionManager {
             .map_err(|e| DomainError::Conflict(format!("exec: {e}")))?;
         drop(guard);
 
+        if let Some(input) = stdin {
+            channel
+                .data(input)
+                .await
+                .map_err(|e| DomainError::Conflict(format!("exec stdin: {e}")))?;
+            channel
+                .eof()
+                .await
+                .map_err(|e| DomainError::Conflict(format!("exec stdin eof: {e}")))?;
+        }
+
         let mut out = Vec::new();
         loop {
             match channel.wait().await {
@@ -819,6 +968,80 @@ impl ConnectionManager {
             }
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// Run `command` on a dedicated exec channel (never in a user's terminal) and capture
+    /// stdout, stderr and the exit status. Stops waiting after `timeout`; output beyond
+    /// `max_output` bytes per stream is dropped and reported as truncated.
+    pub async fn exec_capture(
+        &self,
+        host_id: &str,
+        command: &str,
+        timeout: std::time::Duration,
+        max_output: usize,
+    ) -> Result<ExecCapture, DomainError> {
+        let session_id = self.session_open(host_id).await?;
+        let live =
+            self.sessions
+                .read()
+                .await
+                .get(&session_id)
+                .cloned()
+                .ok_or(DomainError::NotFound {
+                    entity: "session",
+                    id: Some(session_id),
+                })?;
+        let guard = live.lock().await;
+        let mut channel = guard
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| DomainError::Conflict(format!("exec channel: {e}")))?;
+        drop(guard);
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| DomainError::Conflict(format!("exec: {e}")))?;
+        // No stdin: commands that read it see EOF instead of hanging.
+        let _ = channel.eof().await;
+
+        let mut cap = ExecCapture::default();
+        let push = |buf: &mut Vec<u8>, data: &[u8], truncated: &mut bool| {
+            let room = max_output.saturating_sub(buf.len());
+            if data.len() > room {
+                *truncated = true;
+            }
+            buf.extend_from_slice(&data[..data.len().min(room)]);
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, channel.wait()).await {
+                Err(_) => {
+                    cap.timed_out = true;
+                    let _ = channel.close().await;
+                    break;
+                }
+                Ok(Some(ChannelMsg::Data { ref data })) => {
+                    push(&mut stdout, data, &mut cap.truncated)
+                }
+                Ok(Some(ChannelMsg::ExtendedData { ref data, .. })) => {
+                    push(&mut stderr, data, &mut cap.truncated)
+                }
+                Ok(Some(ChannelMsg::ExitStatus { exit_status })) => {
+                    cap.exit_code = Some(exit_status as i32)
+                }
+                Ok(Some(ChannelMsg::ExitSignal { signal_name, .. })) => {
+                    cap.exit_signal = Some(format!("{signal_name:?}"))
+                }
+                Ok(None) | Ok(Some(ChannelMsg::Close)) => break,
+                Ok(Some(_)) => {}
+            }
+        }
+        cap.stdout = String::from_utf8_lossy(&stdout).into_owned();
+        cap.stderr = String::from_utf8_lossy(&stderr).into_owned();
+        Ok(cap)
     }
 
     /// List open panes.
@@ -964,6 +1187,51 @@ impl ConnectionManager {
         .await?;
         let _ = file.shutdown().await;
         Ok((buf, mtime))
+    }
+
+    /// Read at most `max_bytes` from the start (or the end, when `from_end`) of a remote file.
+    /// Returns `(bytes, mtime, total_size)`; works for files of any size.
+    pub async fn sftp_read_range(
+        &self,
+        host_id: &str,
+        path: &str,
+        max_bytes: u64,
+        from_end: bool,
+    ) -> Result<(Vec<u8>, i64, u64), DomainError> {
+        use tokio::io::AsyncSeekExt;
+        let sftp = self.open_sftp(host_id).await?;
+        let meta = sftp
+            .metadata(path)
+            .await
+            .map_err(|e| map_sftp_err("stat", e))?;
+        if meta.file_type().is_dir() {
+            return Err(DomainError::Conflict(
+                "cannot read a directory as a file".into(),
+            ));
+        }
+        let mtime = meta.mtime.unwrap_or(0) as i64;
+        let size = meta.size.unwrap_or(0);
+        let mut file = sftp.open(path).await.map_err(|e| map_sftp_err("open", e))?;
+        if from_end && size > max_bytes {
+            file.seek(std::io::SeekFrom::Start(size - max_bytes))
+                .await
+                .map_err(|e| map_sftp_err("seek", e))?;
+        }
+        let mut buf = Vec::with_capacity(max_bytes.min(size.max(1)) as usize);
+        let mut chunk = vec![0u8; SFTP_READ_CHUNK];
+        while (buf.len() as u64) < max_bytes {
+            let n = file
+                .read(&mut chunk)
+                .await
+                .map_err(|e| map_sftp_err("read", e))?;
+            if n == 0 {
+                break;
+            }
+            let room = (max_bytes - buf.len() as u64) as usize;
+            buf.extend_from_slice(&chunk[..n.min(room)]);
+        }
+        let _ = file.shutdown().await;
+        Ok((buf, mtime, size))
     }
 
     /// Stream a remote file (or directory tree) onto the local filesystem.
@@ -1476,4 +1744,33 @@ where
         .map_err(|e| DomainError::Conflict(format!("flush {}: {e}", local.display())))?;
     let _ = file.shutdown().await;
     Ok(written)
+}
+
+/// Hostname, IPv4 or IPv6 literal — nothing a shell would interpret.
+fn is_safe_probe_addr(addr: &str) -> bool {
+    !addr.is_empty()
+        && addr.len() <= 253
+        && !addr.starts_with('-')
+        && addr
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+}
+
+#[cfg(test)]
+mod probe_addr_tests {
+    use super::is_safe_probe_addr;
+
+    #[test]
+    fn accepts_hosts_and_ips() {
+        for ok in ["127.0.0.1", "db-1.internal", "fe80::1", "my_host"] {
+            assert!(is_safe_probe_addr(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters() {
+        for bad in ["", "a;id", "$(id)", "a b", "x'y", "-oProxy", "a/b", "`id`"] {
+            assert!(!is_safe_probe_addr(bad), "{bad}");
+        }
+    }
 }

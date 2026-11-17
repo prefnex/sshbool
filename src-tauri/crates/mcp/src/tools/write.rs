@@ -4,6 +4,7 @@ use crate::approval::ToolCallContext;
 use crate::error::McpError;
 use crate::policy::paths::{is_hard_deny_delete_path, is_sensitive_read_path};
 use crate::scope::resolve_host_in_scope;
+use crate::util::{shell_quote, validate_path, validate_token};
 use base64::Engine;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -29,15 +30,16 @@ pub fn write_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "edit_file_delta".into(),
-            description: "Apply targeted string/patch edits to a remote file".into(),
+            description: "Replace an exact text snippet in a remote file (needs approval). Safer than write_file for small changes.".into(),
             tier: "write".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "host_id": { "type": "string" },
                     "path": { "type": "string" },
-                    "target_content": { "type": "string" },
+                    "target_content": { "type": "string", "description": "Exact text to replace; must occur exactly once unless replace_all is true" },
                     "replacement_content": { "type": "string" },
+                    "replace_all": { "type": "boolean", "default": false },
                     "expected_mtime": { "type": "integer" }
                 },
                 "required": ["host_id", "path", "target_content", "replacement_content"]
@@ -212,21 +214,20 @@ pub async fn execute_write_tool(
                 .ok_or_else(|| McpError::InvalidArguments("Missing path".into()))?;
             let target = args["target_content"]
                 .as_str()
+                .filter(|t| !t.is_empty())
                 .ok_or_else(|| McpError::InvalidArguments("Missing target_content".into()))?;
             let replacement = args["replacement_content"]
                 .as_str()
                 .ok_or_else(|| McpError::InvalidArguments("Missing replacement_content".into()))?;
-            let preview = exec.sftp_read_preview(host_id, path, 512 * 1024).await?;
-            let old = preview["content"]
-                .as_str()
-                .ok_or_else(|| McpError::Internal("Failed to read file for edit".into()))?;
-            if !old.contains(target) {
-                return Err(McpError::InvalidArguments(
-                    "target_content not found in file".into(),
-                ));
-            }
-            let new_content = old.replace(target, replacement);
-            exec.sftp_write(host_id, path, &new_content, expected_mtime)
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Whole file (bounded): editing a truncated preview would drop the rest of the file.
+            let (old, mtime) = exec.sftp_read_full(host_id, path).await?;
+            let new_content = apply_edit(&old, target, replacement, replace_all)?;
+            // Guard against changes made between our read and the write.
+            exec.sftp_write(host_id, path, &new_content, expected_mtime.or(Some(mtime)))
                 .await
         }
         "upload_file" => {
@@ -268,28 +269,37 @@ pub async fn execute_write_tool(
             exec.sftp_chmod(host_id, path, parse_mode(mode)?).await
         }
         "chown_path" => {
-            let path = args["path"]
-                .as_str()
-                .ok_or_else(|| McpError::InvalidArguments("Missing path".into()))?;
-            let owner = args["owner"]
-                .as_str()
-                .ok_or_else(|| McpError::InvalidArguments("Missing owner".into()))?;
+            let path = validate_path(
+                args["path"]
+                    .as_str()
+                    .ok_or_else(|| McpError::InvalidArguments("Missing path".into()))?,
+                "path",
+            )?;
+            let owner = validate_token(
+                args["owner"]
+                    .as_str()
+                    .ok_or_else(|| McpError::InvalidArguments("Missing owner".into()))?,
+                "owner",
+                &[':'],
+            )?;
             exec.exec_command(
                 host_id,
-                &format!("chown {owner} {path}"),
+                &format!("chown {} -- {}", shell_quote(owner), shell_quote(path)),
                 super::exec_show_terminal(args),
                 super::exec_timeout_ms(args),
             )
             .await
         }
         "kill_process" => {
-            let pid = args["pid"]
-                .as_i64()
-                .ok_or_else(|| McpError::InvalidArguments("Missing pid".into()))?;
+            let pid = args["pid"].as_u64().filter(|p| *p > 1).ok_or_else(|| {
+                McpError::InvalidArguments("pid must be a positive integer > 1".into())
+            })?;
             let signal = args
                 .get("signal")
                 .and_then(|v| v.as_str())
-                .unwrap_or("SIGTERM");
+                .unwrap_or("TERM")
+                .trim_start_matches("SIG");
+            validate_token(signal, "signal", &[])?;
             exec.exec_command(
                 host_id,
                 &format!("kill -s {signal} {pid}"),
@@ -301,5 +311,41 @@ pub async fn execute_write_tool(
         _ => Err(McpError::ToolNotAvailable(format!(
             "Unknown write tool: {tool_name}"
         ))),
+    }
+}
+
+/// Replace `target` in `content`. A target that matches several places is rejected unless
+/// `replace_all`, so the agent cannot silently edit the wrong occurrence.
+pub fn apply_edit(
+    content: &str,
+    target: &str,
+    replacement: &str,
+    replace_all: bool,
+) -> Result<String, McpError> {
+    match content.matches(target).count() {
+        0 => Err(McpError::InvalidArguments(
+            "target_content not found in file (re-read the file; it must match exactly)".into(),
+        )),
+        1 => Ok(content.replacen(target, replacement, 1)),
+        _ if replace_all => Ok(content.replace(target, replacement)),
+        n => Err(McpError::InvalidArguments(format!(
+            "target_content occurs {n} times; include more surrounding context or set replace_all=true"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_edit;
+
+    #[test]
+    fn edit_requires_unique_match() {
+        assert_eq!(
+            apply_edit("a=1\nb=2", "b=2", "b=3", false).unwrap(),
+            "a=1\nb=3"
+        );
+        assert!(apply_edit("x x", "x", "y", false).is_err());
+        assert_eq!(apply_edit("x x", "x", "y", true).unwrap(), "y y");
+        assert!(apply_edit("abc", "zzz", "y", false).is_err());
     }
 }

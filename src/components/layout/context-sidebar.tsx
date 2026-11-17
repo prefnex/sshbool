@@ -90,6 +90,8 @@ export function ContextSidebar() {
   const conn = host ? (byHost[host.id] ?? { status: "idle" as const }) : null
   const live = conn?.status === "connected"
   const connecting = conn?.status === "connecting"
+  const reconnecting = conn?.status === "reconnecting"
+  const lost = conn?.status === "error" && !!conn.lost
 
   const connect = useMutation({
     mutationFn: async (hostId: string) => {
@@ -147,6 +149,7 @@ export function ContextSidebar() {
                   accent={hostAccent(host)}
                   icon={host.icon}
                   status={conn.status}
+                  lost={conn.lost}
                 />
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold">
@@ -161,6 +164,7 @@ export function ContextSidebar() {
                       "mt-1 text-[11px] font-medium",
                       live && "text-emerald-600 dark:text-emerald-400",
                       connecting && "text-sky-600 dark:text-sky-400",
+                      reconnecting && "text-amber-600 dark:text-amber-400",
                       conn.status === "error" && "text-destructive",
                       conn.status === "idle" && "text-muted-foreground"
                     )}
@@ -169,9 +173,13 @@ export function ContextSidebar() {
                       ? "Connected"
                       : conn.status === "connecting"
                         ? "Connecting…"
-                        : conn.status === "error"
-                          ? "Connection failed"
-                          : "Not connected"}
+                        : reconnecting
+                          ? (conn.detail ?? "Reconnecting…")
+                          : lost
+                            ? "Connection lost"
+                            : conn.status === "error"
+                              ? "Connection failed"
+                              : "Not connected"}
                   </div>
                 </div>
               </div>
@@ -180,21 +188,35 @@ export function ContextSidebar() {
                   size="sm"
                   variant="outline"
                   className="w-full"
-                  disabled={disconnect.isPending}
+                  disabled={
+                    disconnect.isPending && disconnect.variables === host.id
+                  }
                   onClick={() => disconnect.mutate(host.id)}
                 >
                   <Plug className="size-3.5" />
                   Disconnect
                 </Button>
+              ) : reconnecting ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full"
+                  onClick={() => disconnect.mutate(host.id)}
+                >
+                  <Plug className="size-3.5" />
+                  Stop reconnecting
+                </Button>
               ) : (
                 <Button
                   size="sm"
                   className="w-full"
-                  disabled={connecting || connect.isPending}
+                  // Only this host's own state matters: another server still
+                  // connecting (or hanging) must not block this one.
+                  disabled={connecting}
                   onClick={() => connect.mutate(host.id)}
                 >
                   <PlugZap className="size-3.5" />
-                  {connecting ? "Connecting…" : "Connect"}
+                  {connecting ? "Connecting…" : lost ? "Reconnect" : "Connect"}
                 </Button>
               )}
               {conn.status === "error" && conn.error && (

@@ -1,6 +1,7 @@
 import { clearTerminalScrollback } from "@/features/terminal/terminal-scrollback"
 import { formatAppError, IpcError, ipc } from "@/lib/ipc/commands"
 import { useConnectionStore } from "@/stores/connection.store"
+import { useNetworkStore, waitForOnline } from "@/stores/network.store"
 import { useSessionStore } from "@/stores/session.store"
 import { useTofuStore } from "@/stores/tofu.store"
 import { toast } from "@/stores/toast.store"
@@ -54,6 +55,7 @@ export async function connectHost(
   hostId: string,
   opts?: { label?: string; openPane?: boolean }
 ): Promise<void> {
+  cancelReconnect(hostId)
   const conn = useConnectionStore.getState()
   conn.clearError(hostId)
   conn.setConnecting(hostId)
@@ -112,6 +114,7 @@ export async function connectHost(
 
 /** Tear down SSH session + panes; SFTP/tools lose access until reconnect. */
 export async function disconnectHost(hostId: string): Promise<void> {
+  cancelReconnect(hostId)
   const session = useConnectionStore.getState().byHost[hostId]
   const panes = useSessionStore
     .getState()
@@ -138,4 +141,153 @@ export async function disconnectHost(hostId: string): Promise<void> {
 
   useConnectionStore.getState().setIdle(hostId)
   toast.info("Disconnected")
+}
+
+// ── Automatic reconnect after a dropped session ─────────────────────
+
+/** Payload of the Rust `ssh://session-lost` event (connectivity.rs). */
+export type SessionLostEvent = {
+  hostId: string
+  sessionId: string
+  paneIds: string[]
+  reason: string
+}
+
+const RETRY_DELAYS_MS = [1_000, 3_000, 8_000, 15_000, 30_000]
+/** Stop waiting for the network after this long and report the host as lost. */
+const MAX_OFFLINE_WAIT_MS = 5 * 60_000
+
+const reconnects = new Map<string, AbortController>()
+
+/** Stop an automatic reconnect in progress (user connected/disconnected by hand). */
+export function cancelReconnect(hostId: string): void {
+  reconnects.get(hostId)?.abort()
+  reconnects.delete(hostId)
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(resolve, ms)
+    signal.addEventListener("abort", () => {
+      clearTimeout(t)
+      reject(new DOMException("aborted", "AbortError"))
+    })
+  })
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | "timeout"> {
+  return Promise.race([
+    p,
+    new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), ms)
+    ),
+  ])
+}
+
+/** Errors that another attempt cannot fix (they need the user). */
+function isPermanent(err: unknown): boolean {
+  if (err instanceof IpcError) {
+    return [
+      "FingerprintUnknown",
+      "HostKeyChanged",
+      "Unauthorized",
+      "Auth",
+      "NotFound",
+      "Validation",
+    ].includes(err.appError.kind)
+  }
+  return false
+}
+
+function hostLabel(hostId: string): string {
+  return (
+    useSessionStore.getState().panes.find((p) => p.hostId === hostId)?.title ??
+    "Server"
+  )
+}
+
+/** Re-open the SSH session and give every terminal tab of the host a fresh shell. */
+async function restoreSession(hostId: string, signal: AbortSignal) {
+  const { sessionId } = await ipc.sessionOpen(hostId)
+  if (signal.aborted) {
+    await ipc.sessionClose(sessionId).catch(() => {})
+    throw new DOMException("aborted", "AbortError")
+  }
+  useConnectionStore.getState().setConnected(hostId, sessionId)
+
+  const sessions = useSessionStore.getState()
+  for (const old of sessions.panes.filter((p) => p.hostId === hostId)) {
+    if (old.mcpHidden) {
+      sessions.removePane(old.paneId)
+      continue
+    }
+    const wasActive = useSessionStore.getState().activePaneId === old.paneId
+    const pane = await ipc.paneOpen(hostId, 120, 40)
+    clearTerminalScrollback(pane.paneId)
+    const store = useSessionStore.getState()
+    store.addPane({ ...pane, title: old.title })
+    store.removePane(old.paneId)
+    if (wasActive) store.setActive(pane.paneId)
+  }
+}
+
+/**
+ * Called for every `ssh://session-lost` event: retries with backoff, waits for the
+ * network when it is down, and leaves the host flagged as lost if it cannot come back.
+ */
+export async function handleSessionLost(ev: SessionLostEvent): Promise<void> {
+  const { hostId, reason } = ev
+  const current = useConnectionStore.getState().byHost[hostId]
+  // Ignore stale events: the user already disconnected, or a newer session exists.
+  if (!current || current.status !== "connected") return
+  if (current.sessionId && current.sessionId !== ev.sessionId) return
+
+  cancelReconnect(hostId)
+  const ctrl = new AbortController()
+  reconnects.set(hostId, ctrl)
+  const { signal } = ctrl
+  const conn = () => useConnectionStore.getState()
+  const label = hostLabel(hostId)
+
+  conn().setReconnecting(hostId, reason, 0)
+  toast.info("Connection lost", `${label}: ${reason}. Reconnecting…`)
+
+  let lastError: unknown = null
+  try {
+    for (let i = 0; i < RETRY_DELAYS_MS.length; i++) {
+      if (!useNetworkStore.getState().online) {
+        conn().setReconnecting(hostId, "Waiting for the network…", i)
+        const res = await withTimeout(
+          waitForOnline(signal),
+          MAX_OFFLINE_WAIT_MS
+        )
+        if (res === "timeout") {
+          lastError = new Error("no network connection")
+          break
+        }
+      }
+      await sleep(RETRY_DELAYS_MS[i]!, signal)
+      conn().setReconnecting(
+        hostId,
+        `Reconnecting (attempt ${i + 1} of ${RETRY_DELAYS_MS.length})…`,
+        i + 1
+      )
+      try {
+        await restoreSession(hostId, signal)
+        toast.success("Reconnected", label)
+        return
+      } catch (err) {
+        if (signal.aborted) return
+        lastError = err
+        if (isPermanent(err)) break
+      }
+    }
+    const why = lastError ? errMessage(lastError) : reason
+    conn().setError(hostId, `Connection lost: ${reason}`, { lost: true })
+    toast.error("Could not reconnect", `${label}: ${why}`)
+  } catch {
+    /* aborted by the user */
+  } finally {
+    if (reconnects.get(hostId) === ctrl) reconnects.delete(hostId)
+  }
 }

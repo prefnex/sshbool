@@ -222,6 +222,17 @@ export const ipc = {
   ) => call<void>("workspace_window_open_with_host", { wsId, hostId, title }),
   appQuit: () => call<void>("app_quit"),
   trayClose: () => call<void>("tray_close"),
+  networkCheck: () => call<boolean>("network_check"),
+  appBusySet: (reason: "update", busy: boolean) =>
+    call<void>("app_busy_set", { reason, busy }),
+  backgroundSettingsGet: () =>
+    call<{ closeToTray: boolean; launchAtLogin: boolean }>(
+      "background_settings_get"
+    ),
+  backgroundSettingsSet: (patch: {
+    closeToTray?: boolean
+    launchAtLogin?: boolean
+  }) => call<void>("background_settings_set", patch),
 
   paneOpen: (hostId: string, cols: number, rows: number) =>
     call<PaneInfoDto>("pane_open", { hostId, cols, rows }),
@@ -533,18 +544,27 @@ export const ipc = {
     hostId: string,
     remoteTarget: string,
     remotePort: number,
-    protocol?: string
+    protocol?: string,
+    password?: string
   ) =>
     call<{
       sessionId: string
       wsPort: number
+      /** Includes the bridge access token; use it verbatim. */
       wsUrl: string
       localTcpPort: number
       remoteHost: string
       remotePort: number
       protocol: string
-      vaultPassword?: string
-    }>("desktop_inapp_connect", { hostId, remoteTarget, remotePort, protocol }),
+      /** True when the Rust bridge answers VNC auth itself (password never sent to the UI). */
+      bridgeAuth: boolean
+    }>("desktop_inapp_connect", {
+      hostId,
+      remoteTarget,
+      remotePort,
+      protocol,
+      password: password ?? null,
+    }),
 
   desktopGuacamoleConnect: (
     hostId: string,
@@ -582,6 +602,9 @@ export const ipc = {
       colorDepth: colorDepth ?? null,
       performance: performance ?? null,
     }),
+
+  rdpCertForget: (hostId: string, remoteTarget: string, remotePort: number) =>
+    call<void>("rdp_cert_forget", { hostId, remoteTarget, remotePort }),
 
   desktopGuacdSetup: (installDocker?: boolean) =>
     call<{ ok: boolean; message: string }>("desktop_guacd_setup", {

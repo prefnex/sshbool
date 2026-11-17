@@ -8,18 +8,28 @@ use mcp::runtime::McpRuntimeState;
 use mcp::PaneReadyEvent;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 const MCP_PANE_COLS: u32 = 120;
 const MCP_PANE_ROWS: u32 = 40;
+/// Per-stream cap on captured command output returned to an agent.
+const MAX_EXEC_OUTPUT: usize = 512 * 1024;
 
 pub struct AppMcpExecutor {
     state: Arc<AppState>,
     runtime: Arc<McpRuntimeState>,
+    /// Panes opened for MCP, by host. Agents never get the user's own terminals: their
+    /// scrollback may hold anything the user typed or printed.
+    mcp_panes: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl AppMcpExecutor {
     pub fn new(state: Arc<AppState>, runtime: Arc<McpRuntimeState>) -> Self {
-        Self { state, runtime }
+        Self {
+            state,
+            runtime,
+            mcp_panes: Default::default(),
+        }
     }
 
     fn emit_pane_ready(
@@ -57,21 +67,22 @@ impl AppMcpExecutor {
         host_id: &str,
         show_terminal: bool,
     ) -> Result<(String, String, bool), McpError> {
-        if let Some(pane_id) = self.state.connections.find_pane_for_host(host_id).await {
+        let mut owned = self.mcp_panes.lock().await;
+        if let Some(pane_id) = owned.get(host_id).cloned() {
             let panes = self.state.connections.sessions_list().await;
-            let session_id = panes
-                .iter()
-                .find(|(pid, _, _, _)| pid == &pane_id)
-                .map(|(_, sid, _, _)| sid.clone())
-                .unwrap_or_default();
-            self.emit_pane_ready(
-                &pane_id,
-                &session_id,
-                host_id,
-                &self.host_label(host_id).await,
-                show_terminal,
-            );
-            return Ok((pane_id, session_id, false));
+            if let Some((_, session_id, _, _)) = panes.iter().find(|(pid, _, _, _)| *pid == pane_id)
+            {
+                let session_id = session_id.clone();
+                self.emit_pane_ready(
+                    &pane_id,
+                    &session_id,
+                    host_id,
+                    &self.host_label(host_id).await,
+                    show_terminal,
+                );
+                return Ok((pane_id, session_id, false));
+            }
+            owned.remove(host_id); // closed by the user or dropped with the connection
         }
 
         let (pane_id, session_id) = self
@@ -80,6 +91,8 @@ impl AppMcpExecutor {
             .pane_open_mcp(host_id, MCP_PANE_COLS, MCP_PANE_ROWS)
             .await
             .map_err(|e| McpError::Internal(e.to_string()))?;
+        owned.insert(host_id.to_string(), pane_id.clone());
+        drop(owned);
         let label = self.host_label(host_id).await;
         self.emit_pane_ready(&pane_id, &session_id, host_id, &label, show_terminal);
         Ok((pane_id, session_id, true))
@@ -123,14 +136,26 @@ impl McpToolExecutor for AppMcpExecutor {
         host_id: &str,
         path: &str,
         max_bytes: u64,
+        from_end: bool,
     ) -> Result<Value, McpError> {
-        let (content, mtime) = self.state.connections.sftp_read(host_id, path).await?;
-        let truncated = if content.len() as u64 > max_bytes {
-            content[..max_bytes as usize].to_string()
-        } else {
-            content
-        };
-        Ok(json!({ "path": path, "content": truncated, "mtime": mtime }))
+        let (bytes, mtime, size) = self
+            .state
+            .connections
+            .sftp_read_range(host_id, path, max_bytes, from_end)
+            .await?;
+        let truncated = (bytes.len() as u64) < size;
+        Ok(json!({
+            "path": path,
+            "content": String::from_utf8_lossy(&bytes),
+            "mtime": mtime,
+            "size": size,
+            "truncated": truncated,
+            "from": if from_end { "end" } else { "start" },
+        }))
+    }
+
+    async fn sftp_read_full(&self, host_id: &str, path: &str) -> Result<(String, i64), McpError> {
+        Ok(self.state.connections.sftp_read(host_id, path).await?)
     }
 
     async fn sftp_write(
@@ -226,34 +251,29 @@ impl McpToolExecutor for AppMcpExecutor {
         show_terminal: bool,
         timeout_ms: u64,
     ) -> Result<Value, McpError> {
-        let (pane_id, _, _) = self.ensure_mcp_pane(host_id, show_terminal).await?;
-        match self
+        if show_terminal {
+            // Bring the host's terminal forward so the user can follow along; the command itself
+            // still runs on its own channel so it never types into a shell the user is using.
+            let _ = self.ensure_mcp_pane(host_id, true).await;
+        }
+        let cap = self
             .state
             .connections
-            .exec_in_pane(&pane_id, command, timeout_ms)
-            .await
-        {
-            Ok(output) if !output.trim().is_empty() => Ok(json!({
-                "stdout": output,
-                "status": "executed",
-                "pane_id": pane_id,
-                "mode": "pane",
-            })),
-            Ok(_) | Err(_) => {
-                let output = self
-                    .state
-                    .connections
-                    .exec_command(host_id, command)
-                    .await
-                    .map_err(|e| McpError::Internal(e.to_string()))?;
-                Ok(json!({
-                    "stdout": output,
-                    "status": "executed",
-                    "pane_id": pane_id,
-                    "mode": "headless_fallback",
-                }))
-            }
-        }
+            .exec_capture(
+                host_id,
+                command,
+                Duration::from_millis(timeout_ms.max(1000)),
+                MAX_EXEC_OUTPUT,
+            )
+            .await?;
+        Ok(json!({
+            "stdout": cap.stdout,
+            "stderr": cap.stderr,
+            "exit_code": cap.exit_code,
+            "exit_signal": cap.exit_signal,
+            "timed_out": cap.timed_out,
+            "truncated": cap.truncated,
+        }))
     }
 
     async fn exec_command_readonly(
@@ -265,5 +285,11 @@ impl McpToolExecutor for AppMcpExecutor {
     ) -> Result<Value, McpError> {
         self.exec_command(host_id, command, show_terminal, timeout_ms)
             .await
+    }
+
+    async fn read_pane_output(&self, pane_id: &str, max_bytes: usize) -> Result<String, McpError> {
+        let bytes = self.state.connections.pane_scrollback_get(pane_id).await;
+        let start = bytes.len().saturating_sub(max_bytes);
+        Ok(String::from_utf8_lossy(&bytes[start..]).into_owned())
     }
 }

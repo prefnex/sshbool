@@ -118,8 +118,8 @@ async fn test_full_mcp_e2e_lifecycle() {
         .clone();
     assert_eq!(
         tools.len(),
-        28,
-        "Must contain exactly 28 SAFE tools in read_only mode"
+        26,
+        "Must contain exactly 26 SAFE tools in read_only mode"
     );
 
     // 6. Verify calls ledger dual-write
@@ -128,5 +128,9 @@ async fn test_full_mcp_e2e_lifecycle() {
         .await
         .unwrap();
 
-    assert_eq!(call_count, 2, "Ledger must contain 2 recorded RPC calls");
+    // initialize is recorded; tools/list is a catalog read and is not.
+    assert_eq!(
+        call_count, 1,
+        "Ledger must contain the initialize call only"
+    );
 }
