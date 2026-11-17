@@ -136,10 +136,7 @@ pub fn is_hard_deny_delete_path(path: &str) -> bool {
     }
     // Path with fewer than two segments (e.g. "/etc", "/var")
     let segments: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
-    if segments.len() < 2 {
-        return true;
-    }
-    false
+    segments.len() < 2
 }
 
 #[cfg(test)]
