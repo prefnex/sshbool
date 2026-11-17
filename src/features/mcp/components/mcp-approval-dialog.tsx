@@ -10,7 +10,6 @@ import {
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
 import { toast } from "@/stores/toast.store"
 import {
@@ -25,7 +24,8 @@ function renderCommandBytes(text: string): string {
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i)
     if (code === 9) out += "\\t"
-    else if (code === 10) out += "\\n"
+    // Keep real line breaks so multi-line scripts stay readable; escape everything else.
+    else if (code === 10) out += "\n"
     else if (code === 13) out += "\\r"
     else if (code < 32 || code === 127)
       out += `\\x${code.toString(16).padStart(2, "0")}`
@@ -162,15 +162,17 @@ export function McpApprovalDialog() {
       <DialogContent
         showCloseButton={false}
         className={cn(
-          "gap-3 sm:max-w-lg",
+          // Flex column with a scrolling body: long commands must never push the
+          // action buttons off screen.
+          "flex max-h-[calc(100dvh-2rem)] flex-col gap-3 overflow-hidden sm:max-w-2xl",
           current.production &&
             current.riskTier === "dangerous" &&
             "border-destructive/50"
         )}
       >
-        <DialogHeader>
+        <DialogHeader className="shrink-0">
           <div className="flex items-start justify-between gap-3">
-            <div className="space-y-1">
+            <div className="min-w-0 space-y-1">
               <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
                 {headerIcon}
                 Approve remote action
@@ -191,98 +193,102 @@ export function McpApprovalDialog() {
           </div>
         </DialogHeader>
 
-        <div className="grid grid-cols-3 gap-2 text-xs">
-          <div className="rounded-xl border border-border/70 bg-muted/30 p-2">
-            <span className="mb-0.5 block text-muted-foreground">Client</span>
-            <span className="font-medium">{current.clientName}</span>
-          </div>
-          <div className="rounded-xl border border-border/70 bg-muted/30 p-2">
-            <span className="mb-0.5 block text-muted-foreground">Host</span>
-            <span className="font-mono text-xs">
-              {current.hostLabel ?? "—"}
-            </span>
-            {current.production && (
-              <Badge
-                variant="outline"
-                className="mt-1 border-destructive/50 text-[10px] text-destructive"
-              >
-                PRODUCTION
-              </Badge>
-            )}
-          </div>
-          <div className="rounded-xl border border-border/70 bg-muted/30 p-2">
-            <span className="mb-0.5 block text-muted-foreground">Tool</span>
-            <span className="font-mono text-xs select-all">{current.tool}</span>
-          </div>
-        </div>
-
-        {current.agentReason && (
-          <div className="rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
-            <span className="mb-1 block font-medium">Agent reason</span>
-            <p className="whitespace-pre-wrap text-muted-foreground">
-              {current.agentReason}
-            </p>
-          </div>
-        )}
-
-        {current.commandText && (
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-medium text-muted-foreground">
-                Command (exact bytes)
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-xs"
-                onClick={copyCommand}
-              >
-                {copied ? (
-                  <Check className="h-3.5 w-3.5" />
-                ) : (
-                  <Copy className="h-3.5 w-3.5" />
-                )}
-                Copy
-              </Button>
+        <div className="-mx-1 min-h-0 flex-1 space-y-3 overflow-y-auto px-1">
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            <div className="min-w-0 rounded-xl border border-border/70 bg-muted/30 p-2 break-words">
+              <span className="mb-0.5 block text-muted-foreground">Client</span>
+              <span className="font-medium">{current.clientName}</span>
             </div>
-            <ScrollArea className="max-h-40 rounded-xl border border-border/70 bg-muted/20">
-              <pre className="overflow-x-auto p-3 font-mono text-xs whitespace-pre select-all">
+            <div className="min-w-0 rounded-xl border border-border/70 bg-muted/30 p-2 break-words">
+              <span className="mb-0.5 block text-muted-foreground">Host</span>
+              <span className="font-mono text-xs">
+                {current.hostLabel ?? "—"}
+              </span>
+              {current.production && (
+                <Badge
+                  variant="outline"
+                  className="mt-1 border-destructive/50 text-[10px] text-destructive"
+                >
+                  PRODUCTION
+                </Badge>
+              )}
+            </div>
+            <div className="min-w-0 rounded-xl border border-border/70 bg-muted/30 p-2 break-words">
+              <span className="mb-0.5 block text-muted-foreground">Tool</span>
+              <span className="font-mono text-xs select-all">
+                {current.tool}
+              </span>
+            </div>
+          </div>
+
+          {current.agentReason && (
+            <div className="rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
+              <span className="mb-1 block font-medium">Agent reason</span>
+              <p className="break-words whitespace-pre-wrap text-muted-foreground">
+                {current.agentReason}
+              </p>
+            </div>
+          )}
+
+          {current.commandText && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-muted-foreground">
+                  Command (exact bytes)
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  onClick={copyCommand}
+                >
+                  {copied ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                  Copy
+                </Button>
+              </div>
+              <pre className="max-h-64 overflow-y-auto rounded-xl border border-border/70 bg-muted/20 p-3 font-mono text-xs break-all whitespace-pre-wrap select-all">
                 {renderCommandBytes(current.commandText)}
               </pre>
-            </ScrollArea>
-            <p className="text-[11px] text-muted-foreground">
-              Non-printable characters are shown as escapes.
-            </p>
-          </div>
-        )}
-
-        {current.riskReasons.length > 0 && (
-          <div className="space-y-1 rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
-            <span className="block font-medium">Risk classifier triggers</span>
-            <ul className="list-inside list-disc space-y-0.5 text-muted-foreground">
-              {current.riskReasons.map((reason) => (
-                <li key={reason}>{reason}</li>
-              ))}
-            </ul>
-            <p className="pt-1 text-[11px] text-muted-foreground">
-              Risk analysis is advisory. Approve only if you understand the
-              command.
-            </p>
-          </div>
-        )}
-
-        <div className="rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
-          <span className="mb-1 block font-medium">Dry-run preview</span>
-          {current.previewOutput ? (
-            <pre className="font-mono text-xs whitespace-pre-wrap select-all">
-              {current.previewOutput}
-            </pre>
-          ) : (
-            <span className="text-muted-foreground">Preview unavailable</span>
+              <p className="text-[11px] text-muted-foreground">
+                Tabs and other non-printable characters are shown as escapes.
+              </p>
+            </div>
           )}
+
+          {current.riskReasons.length > 0 && (
+            <div className="space-y-1 rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
+              <span className="block font-medium">
+                Risk classifier triggers
+              </span>
+              <ul className="list-inside list-disc space-y-0.5 text-muted-foreground">
+                {current.riskReasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+              <p className="pt-1 text-[11px] text-muted-foreground">
+                Risk analysis is advisory. Approve only if you understand the
+                command.
+              </p>
+            </div>
+          )}
+
+          <div className="rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
+            <span className="mb-1 block font-medium">Dry-run preview</span>
+            {current.previewOutput ? (
+              <pre className="max-h-48 overflow-y-auto font-mono text-xs break-all whitespace-pre-wrap select-all">
+                {current.previewOutput}
+              </pre>
+            ) : (
+              <span className="text-muted-foreground">Preview unavailable</span>
+            )}
+          </div>
         </div>
 
-        <div className="flex items-center justify-between border-t border-border/70 pt-2 text-xs text-muted-foreground">
+        <div className="flex shrink-0 items-center justify-between border-t border-border/70 pt-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
             <Clock className="h-3.5 w-3.5" />
             Denied automatically in {timeLeftSecs}s — denial is the default
@@ -290,7 +296,7 @@ export function McpApprovalDialog() {
           </span>
         </div>
 
-        <DialogFooter className="gap-2 sm:justify-end">
+        <DialogFooter className="shrink-0 gap-2 sm:flex-wrap sm:justify-end">
           <Button
             ref={denyRef}
             autoFocus
