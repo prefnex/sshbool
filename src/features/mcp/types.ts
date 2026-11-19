@@ -45,4 +45,14 @@ export interface McpCallLog {
   durationMs?: number
   resultBytes?: number
   errorCode?: string
+  /** Redacted JSON of the call arguments (may be cut short). */
+  commandPreview?: string
+  /** The reason the agent gave for the call. */
+  reason?: string
+}
+
+export interface McpCallOutput {
+  output: string | null
+  errorText: string | null
+  truncated: boolean
 }

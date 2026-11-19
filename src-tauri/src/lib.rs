@@ -358,6 +358,7 @@ pub fn run() {
             commands::mcp::mcp_client_grant_host,
             commands::mcp::mcp_client_revoke_host,
             commands::mcp::mcp_calls_list,
+            commands::mcp::mcp_call_output,
             commands::mcp::mcp_approvals_pending,
             commands::mcp::mcp_approval_respond,
             commands::mcp::mcp_kill_switch,

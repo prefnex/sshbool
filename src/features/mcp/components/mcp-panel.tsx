@@ -124,7 +124,10 @@ export function McpPanel() {
           <PolicyTab clients={clients} />
         </TabsContent>
 
-        <TabsContent value="activity" className="mt-3 min-h-0 flex-1">
+        <TabsContent
+          value="activity"
+          className="mt-3 flex min-h-0 flex-1 flex-col"
+        >
           <ActivityTab calls={calls} />
         </TabsContent>
       </Tabs>

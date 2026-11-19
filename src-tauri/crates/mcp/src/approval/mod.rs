@@ -70,6 +70,12 @@ impl ApprovalBroker {
         }
     }
 
+    /// Drops a pending request without answering it. Returns true if it was still pending.
+    pub fn forget(&self, id: Uuid) -> bool {
+        let mut map = self.pending.lock().expect("approval broker lock");
+        map.remove(&id).is_some()
+    }
+
     /// Cancels all pending approval requests (e.g. on vault lock or kill switch).
     pub fn cancel_all(&self, reason: ApprovalOutcome) {
         let senders = {

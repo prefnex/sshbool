@@ -55,12 +55,33 @@ jobs:
         with:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
-      - name: Get app version
+      - name: Get app version and changelog
         id: get_version
         shell: bash
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          echo "version=v$VERSION" >> "$GITHUB_OUTPUT"
+          TAG="v$VERSION"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "body<<CHANGELOG_EOF"
+            node -e '
+              const fs = require("fs");
+              const tag = process.argv[1];
+              let body = "See CHANGELOG.md for details.";
+              if (fs.existsSync("CHANGELOG.md")) {
+                const lines = fs.readFileSync("CHANGELOG.md", "utf8").split(/\r?\n/);
+                const start = lines.findIndex((l) => l.startsWith("## [" + tag + "]"));
+                if (start !== -1) {
+                  let end = lines.findIndex((l, i) => i > start && l.startsWith("## ["));
+                  if (end === -1) end = lines.length;
+                  const section = lines.slice(start + 1, end).join("\n").trim();
+                  if (section) body = section;
+                }
+              }
+              console.log(body);
+            ' "$TAG"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,7 +97,7 @@ jobs:
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || steps.get_version.outputs.version }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('SSHBool {0}', github.ref_name) || format('SSHBool {0}', steps.get_version.outputs.version) }}
-          releaseBody: "See the docs for changelog."
+          releaseBody: ${{ steps.get_version.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

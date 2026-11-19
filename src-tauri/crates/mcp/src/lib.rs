@@ -73,6 +73,8 @@ pub struct CallLogEntry {
     pub duration_ms: Option<i64>,
     pub result_bytes: Option<i64>,
     pub error_code: Option<String>,
+    pub command_preview: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// Event payload when MCP server state changes.
@@ -88,6 +90,9 @@ pub struct ServerState {
 /// Implemented by the top-level app crate over `tauri::AppHandle` to emit events without coupling `mcp` to `tauri`.
 pub trait McpNotifier: Send + Sync + 'static {
     fn approval_requested(&self, req: &ApprovalRequest);
+    /// An approval left the pending state: decided, timed out, or its caller went away.
+    /// Lets the GUI drop requests nobody is waiting on any more.
+    fn approval_resolved(&self, _approval_id: &str) {}
     fn call_recorded(&self, entry: &CallLogEntry);
     fn server_state_changed(&self, state: &ServerState);
     fn pane_ready(&self, event: &PaneReadyEvent);

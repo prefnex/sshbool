@@ -19,7 +19,7 @@ const baseUpdate = (
   overrides: Partial<UpdateCheckResult> = {}
 ): UpdateCheckResult => ({
   has_update: true,
-  current_version: "0.1.11",
+  current_version: "0.1.12",
   latest_version: "0.2.0",
   platform: "windows-x86_64",
   platform_download_url: "https://example.com/setup.exe",
@@ -39,7 +39,7 @@ const baseUpdate = (
 
 const packagedApp: AppInfoDto = {
   name: "SSHBool",
-  version: "0.1.11",
+  version: "0.1.12",
   tauriVersion: "2",
   updatePlatform: "windows-x86_64",
   installDir: "C:\\Program Files\\SSHBool",

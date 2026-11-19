@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest"
-import { normalizeApproval, type McpApprovalRequest } from "@/stores/mcp.store"
+import { beforeEach, describe, expect, it } from "vitest"
+import {
+  isTerminalApprovalError,
+  normalizeApproval,
+  selectCurrentApproval,
+  useMcpApprovalStore,
+  type McpApprovalRequest,
+} from "@/stores/mcp.store"
 
 function isGrantButtonVisible(req: McpApprovalRequest): boolean {
   return req.grantable && req.riskTier !== "dangerous"
@@ -75,5 +81,92 @@ describe("MCP approval affordances", () => {
       expiresAt: Date.now() + 60_000,
     }
     expect(isGrantButtonVisible(req)).toBe(false)
+  })
+})
+
+function makeReq(id: string, expiresIn = 60_000): McpApprovalRequest {
+  return {
+    approvalId: id,
+    clientId: "c1",
+    clientName: "Cursor",
+    hostId: "h1",
+    hostLabel: "Dev",
+    production: false,
+    tool: "exec_command",
+    riskTier: "dangerous",
+    riskReasons: [],
+    commandText: "ls",
+    agentReason: null,
+    previewOutput: null,
+    grantable: false,
+    requestedAt: Date.now(),
+    expiresAt: Date.now() + expiresIn,
+  }
+}
+
+describe("isTerminalApprovalError", () => {
+  it("treats AppError objects for gone requests as terminal", () => {
+    expect(
+      isTerminalApprovalError({
+        kind: "Conflict",
+        message: "approval already resolved",
+      })
+    ).toBe(true)
+    expect(
+      isTerminalApprovalError({ kind: "NotFound", entity: "approval" })
+    ).toBe(true)
+    expect(
+      isTerminalApprovalError("no pending approval gate — timed out")
+    ).toBe(true)
+  })
+
+  it("keeps the request for unrelated failures", () => {
+    expect(
+      isTerminalApprovalError({ kind: "Db", engine: "sqlite", message: "busy" })
+    ).toBe(false)
+  })
+})
+
+describe("approval queue", () => {
+  beforeEach(() => {
+    useMcpApprovalStore.setState({
+      queue: [],
+      activeId: null,
+      open: false,
+      respondingId: null,
+    })
+  })
+
+  it("opens for the first request and keeps the current one when more arrive", () => {
+    const s = useMcpApprovalStore.getState()
+    s.enqueue(makeReq("a"))
+    s.hide()
+    s.enqueue(makeReq("b"))
+    const st = useMcpApprovalStore.getState()
+    expect(st.queue.map((r) => r.approvalId)).toEqual(["a", "b"])
+    // Closed by the user: a second request must not force it open again.
+    expect(st.open).toBe(false)
+    st.show("b")
+    expect(
+      selectCurrentApproval(useMcpApprovalStore.getState())?.approvalId
+    ).toBe("b")
+  })
+
+  it("drops resolved and expired requests and closes when empty", () => {
+    const s = useMcpApprovalStore.getState()
+    s.enqueue(makeReq("a"))
+    s.enqueue(makeReq("b", 1_000))
+    s.pruneExpired(Date.now() + 5_000)
+    expect(
+      useMcpApprovalStore.getState().queue.map((r) => r.approvalId)
+    ).toEqual(["a"])
+    s.remove("a")
+    expect(useMcpApprovalStore.getState().open).toBe(false)
+    expect(selectCurrentApproval(useMcpApprovalStore.getState())).toBeNull()
+  })
+
+  it("ignores requests that already expired", () => {
+    useMcpApprovalStore.getState().enqueue(makeReq("old", -1))
+    expect(useMcpApprovalStore.getState().queue).toHaveLength(0)
   })
 })
