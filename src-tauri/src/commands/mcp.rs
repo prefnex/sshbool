@@ -44,7 +44,22 @@ impl McpNotifier for AppNotifier {
             .title(format!("{} needs your approval", req.client_name))
             .body(body)
             .show();
-        crate::tray::show_main(&self.app_handle);
+        // Only raise the window when it isn't already in front: re-showing/unminimizing/
+        // refocusing a visible window on every request makes it visibly flicker.
+        if let Some(w) = self.app_handle.get_webview_window("main") {
+            let in_front = w.is_visible().unwrap_or(false)
+                && !w.is_minimized().unwrap_or(false)
+                && w.is_focused().unwrap_or(false);
+            if !in_front {
+                crate::tray::show_main(&self.app_handle);
+            }
+        }
+    }
+    fn approval_resolved(&self, approval_id: &str) {
+        let _ = self.app_handle.emit(
+            "mcp://approval-resolved",
+            json!({ "approvalId": approval_id }),
+        );
     }
     fn call_recorded(&self, entry: &mcp::CallLogEntry) {
         let _ = self.app_handle.emit("mcp://call-recorded", entry);
@@ -425,9 +440,31 @@ pub async fn mcp_calls_list(
                 "durationMs": r.duration_ms,
                 "resultBytes": r.result_bytes,
                 "errorCode": r.error_code,
+                "commandPreview": r.command_preview,
+                "reason": r.reason,
             })
         })
         .collect())
+}
+
+/// What one call printed (redacted, capped), or null when nothing was stored for it.
+#[tauri::command]
+pub async fn mcp_call_output(
+    state: State<'_, Arc<AppState>>,
+    call_id: String,
+) -> Result<Option<Value>, AppError> {
+    let row = mcp::repo::calls::get_call_output(state.vault.pool(), &call_id)
+        .await
+        .map_err(|e| AppError::Internal {
+            message: e.to_string(),
+        })?;
+    Ok(row.map(|r| {
+        json!({
+            "output": r.output,
+            "errorText": r.error_text,
+            "truncated": r.truncated != 0,
+        })
+    }))
 }
 
 #[tauri::command]

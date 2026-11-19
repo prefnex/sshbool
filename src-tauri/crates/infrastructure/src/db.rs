@@ -131,6 +131,10 @@ const EMBEDDED_MIGRATIONS: &[(&str, &str)] = &[
         "0021_rdp_known_certs",
         include_str!("../../../migrations/0021_rdp_known_certs.sql"),
     ),
+    (
+        "0022_mcp_call_outputs",
+        include_str!("../../../migrations/0022_mcp_call_outputs.sql"),
+    ),
 ];
 
 async fn ensure_migration_table(pool: &SqlitePool) -> Result<(), DomainError> {

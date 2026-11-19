@@ -39,6 +39,33 @@ pub struct GateResult {
     pub grant_id: Option<String>,
 }
 
+/// Clears a pending approval however `gate_tier_tool` exits, including when the agent's
+/// request is dropped mid-wait, and tells the GUI so it never shows a request nobody awaits.
+struct PendingApprovalGuard {
+    uuid: Uuid,
+    approval_id: String,
+    pool: SqlitePool,
+    notifier: Arc<dyn McpNotifier>,
+}
+
+impl Drop for PendingApprovalGuard {
+    fn drop(&mut self) {
+        // Still registered means nobody answered: the caller went away before a decision.
+        if global_broker().forget(self.uuid) {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                let pool = self.pool.clone();
+                let id = self.approval_id.clone();
+                rt.spawn(async move {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let _ =
+                        update_approval_decision(&pool, &id, "revoked", Some("system"), now).await;
+                });
+            }
+        }
+        self.notifier.approval_resolved(&self.approval_id);
+    }
+}
+
 struct HostMeta {
     label: Option<String>,
     production: bool,
@@ -245,6 +272,14 @@ async fn gate_tier_tool(
         requested_at: now,
         expires_at,
     };
+    // Register before the GUI hears about it, so an instant click can't miss the gate.
+    let rx = global_broker().register(approval_uuid);
+    let _pending = PendingApprovalGuard {
+        uuid: approval_uuid,
+        approval_id: approval_id.clone(),
+        pool: ctx.pool.clone(),
+        notifier: notifier.clone(),
+    };
     insert_approval(&ctx.pool, &row).await?;
 
     notifier.approval_requested(&ApprovalRequest {
@@ -267,7 +302,6 @@ async fn gate_tier_tool(
         expires_at,
     });
 
-    let rx = global_broker().register(approval_uuid);
     let response = tokio::time::timeout(
         std::time::Duration::from_millis(ctx.approval_timeout_ms),
         rx,

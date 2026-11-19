@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { WorkspaceSwitcher } from "@/components/layout/workspace-switcher"
 import { NetworkIndicator } from "@/components/layout/network-indicator"
 import { TrayTrigger } from "@/components/tray/tray-popup"
+import { PendingApprovalsButton } from "@/features/mcp/components/pending-approvals-button"
 import { ipc } from "@/lib/ipc/commands"
 import { cn } from "@/lib/utils"
 
@@ -175,6 +176,7 @@ export function WindowChrome({
         className="z-30 flex shrink-0 items-center pr-1"
         style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
       >
+        <PendingApprovalsButton />
         <NetworkIndicator />
         {showPin && (
           <Button

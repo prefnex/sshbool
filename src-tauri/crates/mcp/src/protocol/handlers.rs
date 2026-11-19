@@ -308,6 +308,23 @@ pub async fn handle_protocol_request(
         return JsonRpcResponse::error(id, -32603, format!("Audit write failed: {audit_err}"));
     }
 
+    // Keep what the tool printed so the user can follow results in the Activity view.
+    // Best-effort: a failure here must not fail a call that already ran.
+    if req.method == "tools/call" {
+        let output = res_val.as_ref().map(|v| v.to_string());
+        let error_text = result.as_ref().err().map(agent_message);
+        if let Err(e) = crate::repo::calls::record_call_output(
+            pool,
+            &call_id,
+            output.as_deref(),
+            error_text.as_deref(),
+        )
+        .await
+        {
+            tracing::warn!("failed to store MCP call output: {e}");
+        }
+    }
+
     notifier.call_recorded(&CallLogEntry {
         id: call_id,
         at: now,
@@ -321,6 +338,8 @@ pub async fn handle_protocol_request(
         duration_ms: Some(duration_ms),
         result_bytes: res_val.as_ref().map(|v| v.to_string().len() as i64),
         error_code: err_code,
+        command_preview: call_row.command_preview.clone(),
+        reason: call_row.reason.clone(),
     });
 
     match (req.method.as_str(), result) {
